@@ -1,0 +1,28 @@
+{
+  "title": "AI Prime BLE",
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "bluetooth_confirm": {
+        "title": "AI Prime BLE",
+        "description": "Set up AI Prime BLE device {name} ({address})?"
+      },
+      "user": {
+        "title": "AI Prime BLE — manual setup",
+        "description": "Enter the BLE MAC address of your AI Prime HD light. Use this when automatic Bluetooth discovery does not surface the device.",
+        "data": {
+          "address": "BLE MAC address",
+          "name": "Friendly name"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This device is already configured.",
+      "no_devices_found": "No AI Prime BLE devices were discovered."
+    },
+    "error": {
+      "invalid_address": "Not a valid BLE MAC address.",
+      "cannot_connect": "Cannot connect to the device."
+    }
+  }
+}

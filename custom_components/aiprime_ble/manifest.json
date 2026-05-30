@@ -1,0 +1,16 @@
+{
+  "domain": "aiprime_ble",
+  "name": "AI Prime BLE",
+  "codeowners": ["@JLay2026"],
+  "config_flow": true,
+  "dependencies": ["bluetooth"],
+  "documentation": "https://github.com/JLay2026/ha-aiprime-ble",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/JLay2026/ha-aiprime-ble/issues",
+  "requirements": [],
+  "bluetooth": [
+    {"local_name": "MOBIUS"}
+  ],
+  "version": "0.0.1"
+}
