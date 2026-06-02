@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — hot-fix #2 (2026-06-02, post-merge regression)
+- **Restore `ATTR_LIVE_CHANNEL_TARGET` symbol.** PR #10's rebased rename of
+  the `1504` attribute constant (to `ATTR_LIVE_CHANNEL_STATE`) silently
+  dropped `ATTR_LIVE_CHANNEL_TARGET`, but `protocol/fsci.py` still imports
+  that name in `build_get_channel_targets` and `build_set_channel`. The
+  resulting `ImportError` at module load made the integration fail to set
+  up, and HA marked every `aiprime_ble` entity as "no longer being
+  provided by the integration" — Master Light, all 6 channel number
+  entities, BLE RSSI, Fan, Firmware version, and the 5 device-info
+  sensors all went unavailable simultaneously.
+
+  Restored as a backward-compat alias: `ATTR_LIVE_CHANNEL_TARGET =
+  ATTR_LIVE_CHANNEL_STATE`. Both names point at the same attribute (1504)
+  which empirically does double duty (the probe confirmed reads return
+  the live target). PR-3c will rename the `fsci.py` builders and fix the
+  stale 2-byte / `1000`-clamp inside `build_set_channel` in one pass; at
+  that point this alias can be removed.
+
+- **`manifest.json`:** version `0.1.2` → `0.1.3`. Patch bump — regression fix.
+
+### Notes — hot-fix #2
+- Detected via `search_code` for `ATTR_LIVE_CHANNEL_TARGET` across the
+  repo immediately after the user reported all entities unavailable
+  post-merge. The lesson here matches `[[config-file-full-rewrite-trap]]`
+  — symbol renames in shared modules require a grep pass before merge.
+  A pre-merge CI lint that runs `python -c "import custom_components.aiprime_ble"`
+  would have caught this; tracking as a Day-N+1 housekeeping item.
+
 ### Fixed — hot-fix (2026-06-02, rebased)
 - **Channel-state poll now reports real brightness values.** PR-3a's poll
   was reading attribute `1500` (placeholder, marked "best guess from dump
@@ -182,6 +210,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   user-facing 0-100% into the right raw value.
 - Post-write re-poll to confirm device state.
 - Verify `instance=channel_id` is correct vs. positional indexing.
+- Also: rename `fsci.py`'s `build_get_channel_targets` → `build_get_channel_state_all`
+  (or similar), drop the `ATTR_LIVE_CHANNEL_TARGET` alias added in hot-fix #2,
+  and fix the stale 2-byte / 1000-clamp inside `build_set_channel` to use
+  `CHANNEL_STATE_ITEM_LEN` + `DEVICE_VALUE_MAX`.
 
 ### Pending (Day 5 — per-channel sliders + channel-name discovery)
 - `number.py` per-channel sliders connected to `async_set_channel`.
