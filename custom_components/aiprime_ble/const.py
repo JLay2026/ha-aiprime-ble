@@ -140,6 +140,15 @@ ATTR_LIVE_CHANNEL_LAST_SET = 1513 # 4-byte uint32 LE; mirrors LIVE_CHANNEL_STATE
 ATTR_SCENES = 400
 ATTR_SCHEDULE = 500
 
+# Backward-compat alias for protocol/fsci.py's build_get_channel_targets and
+# build_set_channel — PR #10's rebased rename dropped this symbol but fsci.py
+# still imports it, causing ImportError at integration load. Both names point
+# at the same attribute (1504) which does double duty: reading current state
+# and writing target. PR-3c will rename the fsci.py builders + fix the
+# stale 2-byte/1000-clamp inside build_set_channel, and at that point this
+# alias can be removed.
+ATTR_LIVE_CHANNEL_TARGET = ATTR_LIVE_CHANNEL_STATE
+
 # Wire size (in bytes) of an `ATTR_LIVE_CHANNEL_STATE` value. The hot-fix
 # changed this from 2 (uint16 LE, per-mille) to 4 (uint32 LE, raw scale).
 CHANNEL_STATE_ITEM_LEN = 4
