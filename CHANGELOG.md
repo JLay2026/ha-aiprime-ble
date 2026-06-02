@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Day 4 PR-3a (2026-06-02)
+- **Device-side channel discovery.** `_async_discover_channels()` GETs
+  `ATTR_CHANNEL_LIST` (901) at connect and rebuilds `state.channels` from the
+  device's canonical list. Replaces the hardcoded `ALL_CHANNEL_IDS` tuple at
+  runtime, so channels not in our defaults (e.g. the suspected `0x07` Moonlight
+  slot, plus anything the Reef variant might add) start working as soon as
+  they're advertised by the device. Unknown channel IDs get auto-labels like
+  `Channel 0x07`; smoke-test results inform a subsequent CHANNEL_DEFAULT_LABELS
+  fix-up.
+- **Read-only periodic state poll.** Per-channel
+  `GET ATTR_LIVE_CHANNEL_STATE(channel_id)` runs immediately at connect and
+  every `DEFAULT_STATE_POLL_INTERVAL_S` (30s) afterwards via
+  `async_track_time_interval`. Lock-guarded so polls don't overlap; skipped
+  silently when disconnected. One round-trip per channel keeps parsing
+  simple (single-instance responses).
+- **Discovery diagnostics.** Raw `ATTR_CHANNEL_LIST` reply hex + parsed entry
+  hex are logged at DEBUG so we can verify the response format on first
+  smoke-test and adjust parsing if the device packs multiple bytes per entry.
+- **Connect log line extended** with `channels=0x01, 0x10, 0x11, …` listing
+  the discovered channel IDs in sorted order.
+
+### Notes — Day 4 PR-3a
+- No mutating writes — `async_set_channel` / `async_set_power` remain stubs.
+  PR-3c implements the first real write.
+- If `ATTR_CHANNEL_LIST` returns nothing (timeout, malformed, or empty), the
+  hub keeps the hardcoded defaults from `_initialize_channels` rather than
+  going silent. WARNING-level log makes this visible.
+- Channel-list parsing assumes one byte per entry. If MOBIUS packs (id +
+  metadata) bytes per entry, the DEBUG hex dump will reveal it and we
+  adjust in a fix-up.
+
+### Pending (Day 4 PR-3b — FSCI firmware read)
+- `_read_fsci_firmware()` to populate `state.firmware` from
+  `ATTR_FIRMWARE_VERSION (11)`.
+
+### Pending (Day 4 PR-3c — first mutating write)
+- Real `async_set_channel` via lifted FSCI codec.
+- Post-write re-poll to confirm device state.
+- Verify `instance=channel_id` is correct vs. positional indexing.
+
 ### Added — Day 4 PR-2 (2026-06-02)
 - **Real BLE connection lifecycle** in `aiprime_hub.py`:
   - HA `bluetooth` integration resolves `BLEDevice` from the configured MAC.
@@ -40,14 +80,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`manifest.json`:** declares `bleak-retry-connector>=3.4.0` requirement;
   bumps version to `0.0.2`.
 
-### Notes — Day 4 PR-2
-- `async_set_channel` / `async_set_power` remain stubs — those are PR-3 (first
-  mutating write). Shipping writes without the periodic state poll that PR-3
-  introduces would risk silently driving the light to an unexpected state.
-- The existing `Firmware version` sensor (FSCI `ATTR_FIRMWARE_VERSION`) still
-  shows as unavailable — verifying that attribute returns sensible data is part
-  of PR-3's smoke test.
-
 ### Added — Day 4 PR-1 (2026-06-02)
 - **FSCI protocol codec** (`protocol/fsci.py`): full frame builder lifted from
   [mpshevlotsky/ai-pump-feed-esp32](https://github.com/mpshevlotsky/ai-pump-feed-esp32)
@@ -71,11 +103,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **0x180A char UUID constants** + `SERVICE_DEVICE_INFO` in `const.py`.
 - **`CHAR_AUX = 01ff0105-…`** constant for the 5th proprietary GATT char
   discovered during Day 3 validation. Purpose TBD; held for future PRs.
-
-### Pending (Day 4 PR-3 — first mutating write)
-- Real `async_set_channel` via lifted FSCI codec.
-- Periodic state poll every 30s via `build_get_channel_state`.
-- Verify `ATTR_FIRMWARE_VERSION` returns parseable data, populate `state.firmware`.
 
 ### Pending (Day 5 — per-channel sliders + channel-name discovery)
 - `number.py` per-channel sliders connected to `async_set_channel`.
