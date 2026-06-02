@@ -5,15 +5,18 @@ lifecycle (connect/disconnect, RX dispatch, post-connect ATTR_SERIAL + 0x180A
 reads, passive RSSI tracking, reconnect loop with exponential backoff).
 
 PR-3a (2026-06-02) — adds READ-ONLY periodic state poll:
-  - Channel-list DISCOVERY at connect via GET ATTR_CHANNEL_LIST (901). The
-    device's canonical channel set replaces our hardcoded ALL_CHANNEL_IDS
-    at runtime. If discovery returns nothing the hub leaves the initialized
-    defaults in place and logs a warning (no fallback guessing).
-  - Per-channel GET ATTR_LIVE_CHANNEL_STATE(channel_id) at connect plus
-    every DEFAULT_STATE_POLL_INTERVAL_S afterwards. Lock-guarded so polls
-    don't overlap; skipped silently when disconnected.
-  - No mutating writes — async_set_channel / async_set_power remain stubs.
-    PR-3c implements the first real write.
+  - Channel-list DISCOVERY at connect via GET ATTR_CHANNEL_LIST (901).
+  - Per-channel GET ATTR_LIVE_CHANNEL_STATE(channel_id) every 30s.
+
+PR-3b (2026-06-02) — small read + polish:
+  - FSCI firmware read via GET ATTR_FIRMWARE_VERSION (11), populates
+    state.firmware (lights up the existing Firmware sensor).
+  - First 5 connect attempts log at DEBUG instead of WARNING. HA boot
+    typically takes ~5-25s for the bluetooth integration to populate
+    its device cache, and the noisy "BLE device not found in cache;
+    will retry" stream during that window isn't actionable. Real
+    failures (after attempt 6 ≈ ~60s of sustained backoff) still
+    escalate to WARNING.
 
 Reconnect topology: one long-running `_connect_with_retry` task per
 "connection epoch". The task loops with exponential backoff until a connect
@@ -46,6 +49,7 @@ from bleak_retry_connector import (
 from .const import (
     ALL_CHANNEL_IDS,
     ATTR_CHANNEL_LIST,
+    ATTR_FIRMWARE_VERSION,
     ATTR_LIVE_CHANNEL_STATE,
     ATTR_SERIAL,
     CHANNEL_DEFAULT_LABELS,
@@ -79,6 +83,12 @@ _LOGGER = logging.getLogger(__name__)
 # generous to cover BLE retry behavior on the ESP32 proxy hop).
 _REQUEST_TIMEOUT_S = 5.0
 
+# Attempt threshold below which connect failures log at DEBUG instead of
+# WARNING. PR-3b polish. HA boot typically takes ~5-25s for the bluetooth
+# integration to populate its device cache; warnings during that window
+# aren't actionable.
+_QUIET_CONNECT_ATTEMPTS = 5
+
 
 class AIPrimeHub:
     """Owns the BLE session and the in-memory device state."""
@@ -102,6 +112,8 @@ class AIPrimeHub:
         self._connect_task: asyncio.Task[None] | None = None
         self._reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF_INITIAL_S
         self._intentional_disconnect: bool = False
+        # PR-3b: attempt counter consumed by _attempt_log_level().
+        self._connect_attempt: int = 0
 
         # State poll (PR-3a)
         self._poll_lock = asyncio.Lock()
@@ -114,7 +126,6 @@ class AIPrimeHub:
             _LOGGER.error("AIPrimeHub setup: no CONF_ADDRESS in entry data")
             return
 
-        # Passive RSSI tracking — works even when GATT is down.
         unsub_rssi = bluetooth.async_register_callback(
             self.hass,
             self._handle_advertisement,
@@ -123,9 +134,6 @@ class AIPrimeHub:
         )
         self.entry.async_on_unload(unsub_rssi)
 
-        # Periodic state poll (PR-3a). Initial snapshot happens inline in
-        # _async_connect so first values land within ~5s of connect; this
-        # schedule keeps them fresh thereafter.
         unsub_poll = async_track_time_interval(
             self.hass,
             self._async_poll_state_callback,
@@ -133,12 +141,9 @@ class AIPrimeHub:
         )
         self.entry.async_on_unload(unsub_poll)
 
-        # Kick off the first connect attempt in the background — don't block
-        # entry setup on BLE since the device may be temporarily out of range.
         self._spawn_connect_task()
 
     async def async_unload(self) -> None:
-        """Tear down: cancel reconnect loop, disconnect cleanly."""
         self._intentional_disconnect = True
         if self._connect_task and not self._connect_task.done():
             self._connect_task.cancel()
@@ -151,7 +156,6 @@ class AIPrimeHub:
     # --- Connection management -------------------------------------------
 
     def _spawn_connect_task(self) -> None:
-        """Spawn a fresh `_connect_with_retry` loop if none is already running."""
         if self._intentional_disconnect:
             return
         if self._connect_task and not self._connect_task.done():
@@ -161,10 +165,10 @@ class AIPrimeHub:
         )
 
     async def _connect_with_retry(self) -> None:
-        """Loop until connected (or until unload marks intentional disconnect)."""
         attempt = 0
         while not self._intentional_disconnect:
             attempt += 1
+            self._connect_attempt = attempt
             try:
                 await self._async_connect()
             except asyncio.CancelledError:
@@ -198,8 +202,18 @@ class AIPrimeHub:
             except asyncio.CancelledError:
                 raise
 
+    def _attempt_log_level(self) -> int:
+        """DEBUG for first `_QUIET_CONNECT_ATTEMPTS` attempts; WARNING after.
+
+        Used by `_async_connect` to suppress the boot-noise stream of
+        "BLE device not found in cache" and similar transient failures
+        while HA's bluetooth integration is warming up.
+        """
+        if self._connect_attempt <= _QUIET_CONNECT_ATTEMPTS:
+            return logging.DEBUG
+        return logging.WARNING
+
     async def _async_connect(self) -> None:
-        """One connect attempt: resolve BLEDevice, open GATT, post-connect reads."""
         async with self._connect_lock:
             if self._client and self._client.is_connected:
                 return
@@ -210,10 +224,12 @@ class AIPrimeHub:
                 self.hass, self.address, connectable=True
             )
             if ble_device is None:
-                _LOGGER.warning(
+                _LOGGER.log(
+                    self._attempt_log_level(),
                     "AIPrimeHub %s: BLE device not found in HA bluetooth "
-                    "cache; will retry",
+                    "cache; will retry (attempt %d)",
                     self.address,
+                    self._connect_attempt,
                 )
                 return
 
@@ -228,8 +244,12 @@ class AIPrimeHub:
                     max_attempts=3,
                 )
             except BLEAK_RETRY_EXCEPTIONS as err:
-                _LOGGER.warning(
-                    "AIPrimeHub %s: connect failed: %s", self.address, err
+                _LOGGER.log(
+                    self._attempt_log_level(),
+                    "AIPrimeHub %s: connect failed (attempt %d): %s",
+                    self.address,
+                    self._connect_attempt,
+                    err,
                 )
                 return
 
@@ -240,6 +260,8 @@ class AIPrimeHub:
                 await client.start_notify(CHAR_RX_DATA, self._on_rx_data)
                 await client.start_notify(CHAR_RX_FINAL, self._on_rx_final)
             except Exception as err:  # noqa: BLE001
+                # RX subscribe failure means service tree drift or
+                # permission issue — always warn, not transient.
                 _LOGGER.warning(
                     "AIPrimeHub %s: RX subscribe failed: %s", self.address, err
                 )
@@ -251,6 +273,9 @@ class AIPrimeHub:
 
             # FSCI smoke test: GET ATTR_SERIAL(3). Same query as Day 3.
             await self._read_fsci_serial()
+
+            # PR-3b: FSCI firmware version (lights up the Firmware sensor).
+            await self._read_fsci_firmware()
 
             # PR-3a: discover the real channel set from the device.
             await self._async_discover_channels()
@@ -265,17 +290,17 @@ class AIPrimeHub:
             self._notify_state_changed()
             _LOGGER.info(
                 "AIPrimeHub %s: connected; serial=%s manufacturer=%s "
-                "model=%s firmware=%s channels=%s",
+                "build=%s fw_di=%s fw_fsci=%s channels=%s",
                 self.address,
                 self.state.serial,
                 self.state.manufacturer,
                 self.state.model_number,
                 self.state.firmware_revision,
+                self.state.firmware,
                 ", ".join(f"0x{cid:02X}" for cid in sorted(self.state.channels)),
             )
 
     async def _async_disconnect(self) -> None:
-        """Drop the GATT link, cancel pending requests, mark unavailable."""
         client = self._client
         self._client = None
         was_connected = self.state.ble_connected
@@ -297,7 +322,6 @@ class AIPrimeHub:
             self._notify_availability_changed()
 
     def _handle_disconnected(self, _client: Any) -> None:
-        """bleak-side callback when the GATT link drops."""
         _LOGGER.debug(
             "AIPrimeHub %s: bleak disconnected callback", self.address
         )
@@ -308,6 +332,9 @@ class AIPrimeHub:
         self._in_flight.clear()
         self._notify_availability_changed()
         if not self._intentional_disconnect:
+            # Fresh epoch — reset attempt counter + backoff so a new
+            # connect-with-retry loop logs its early attempts at DEBUG.
+            self._connect_attempt = 0
             self._reconnect_backoff = DEFAULT_RECONNECT_BACKOFF_INITIAL_S
             self._spawn_connect_task()
 
@@ -410,6 +437,69 @@ class AIPrimeHub:
                 "AIPrimeHub %s: serial decode failed: %s", self.address, err
             )
 
+    async def _read_fsci_firmware(self) -> None:
+        """Round-trip GET ATTR_FIRMWARE_VERSION(11), populate state.firmware.
+
+        Decode strategy (best-effort, in priority order):
+          1. Printable ASCII → use as-is (covers "1.0", "1.2.3-rc4", etc.).
+          2. 1-4 bytes → packed version bytes joined with "." (covers
+             0x04 0x02 0x01 0x01 → "4.2.1.1").
+          3. Anything else → hex string for diagnostic visibility.
+
+        Raw payload is logged at DEBUG either way so the actual wire bytes
+        are visible if decode picks the wrong strategy.
+        """
+        msg_id, frame = self._codec.build_get_attribute(ATTR_FIRMWARE_VERSION)
+        reply = await self._send_request(msg_id, frame)
+        if reply is None:
+            _LOGGER.debug(
+                "AIPrimeHub %s: ATTR_FIRMWARE_VERSION read returned no frame",
+                self.address,
+            )
+            return
+        status = parse_response_status(reply)
+        if status != STATUS_SUCCESS:
+            _LOGGER.warning(
+                "AIPrimeHub %s: ATTR_FIRMWARE_VERSION CONFIRM status=%s",
+                self.address,
+                status_name(status) if status >= 0 else "MalformedFrame",
+            )
+            return
+        values = parse_get_attribute_payload(reply, ATTR_FIRMWARE_VERSION)
+        if not values:
+            _LOGGER.debug(
+                "AIPrimeHub %s: ATTR_FIRMWARE_VERSION parsed empty value list",
+                self.address,
+            )
+            return
+        raw = values[0]
+        decoded = self._decode_firmware_value(raw)
+        self.state.firmware = decoded
+        _LOGGER.debug(
+            "AIPrimeHub %s: ATTR_FIRMWARE_VERSION raw=%s decoded=%s",
+            self.address,
+            to_hex(raw),
+            decoded,
+        )
+
+    @staticmethod
+    def _decode_firmware_value(raw: bytes) -> str:
+        """Pick the most-readable interpretation of an FSCI firmware payload."""
+        if not raw:
+            return ""
+        # Strategy 1: printable ASCII.
+        try:
+            text = raw.decode("utf-8", errors="strict").strip()
+            if text and all(c.isprintable() and ord(c) < 127 for c in text):
+                return text
+        except UnicodeDecodeError:
+            pass
+        # Strategy 2: packed version bytes joined with ".".
+        if 1 <= len(raw) <= 4:
+            return ".".join(str(b) for b in raw)
+        # Strategy 3: hex fallback.
+        return raw.hex()
+
     async def _read_device_info(self, client: BleakClientWithServiceCache) -> None:
         try:
             info = await read_device_info(client)
@@ -428,16 +518,6 @@ class AIPrimeHub:
     # --- PR-3a: channel discovery + state poll ---------------------------
 
     async def _async_discover_channels(self) -> None:
-        """GET ATTR_CHANNEL_LIST(901), rebuild state.channels from device data.
-
-        If the read fails or returns nothing, leave the initialized defaults
-        in place and log a warning. We do NOT fall back to guessing — the
-        user's choice during PR-3a planning was "trust the device".
-
-        Channel-list payload format is unverified — assumed to be one byte
-        per channel ID. The raw reply is logged at DEBUG so we can adjust
-        parsing if the smoke test reveals a different shape.
-        """
         msg_id, frame = self._codec.build_get_attribute(
             ATTR_CHANNEL_LIST, instance=0, count=0xFF
         )
@@ -477,10 +557,6 @@ class AIPrimeHub:
             [v.hex() for v in values],
         )
 
-        # Each value is assumed to contain at least one byte = channel ID.
-        # If the device packs multiple bytes per entry (e.g., id + metadata),
-        # the first byte is still the ID — adjust here if smoke test reveals
-        # otherwise.
         discovered: list[int] = []
         for raw in values:
             if not raw:
@@ -495,8 +571,6 @@ class AIPrimeHub:
             )
             return
 
-        # Rebuild state.channels from the discovered list, preserving values
-        # of any channel we already had.
         new_channels: dict[int, ChannelState] = {}
         for cid in discovered:
             existing = self.state.channels.get(cid)
@@ -520,12 +594,6 @@ class AIPrimeHub:
             )
 
     async def _async_read_channel_state(self) -> None:
-        """Per-channel GET ATTR_LIVE_CHANNEL_STATE; updates state.channels values.
-
-        One round-trip per channel keeps the parsing simple (single-instance
-        responses, well-tested code path). At 7 channels × ~50ms each that's
-        ~350ms per poll cycle — well within the 30s poll interval.
-        """
         if not self.state.channels:
             _LOGGER.debug(
                 "AIPrimeHub %s: no channels known; skipping state read",
@@ -573,12 +641,9 @@ class AIPrimeHub:
             self._notify_state_changed()
 
     async def _async_poll_state_callback(self, _now: datetime | None = None) -> None:
-        """Periodic poll wrapper. Skipped if disconnected or already polling."""
         if not self.state.ble_connected:
             return
         if self._poll_lock.locked():
-            # A previous poll is still in flight; skip rather than queue up
-            # (queueing would risk overlapping reads if the device is slow).
             return
         async with self._poll_lock:
             try:
@@ -592,15 +657,12 @@ class AIPrimeHub:
                     err,
                 )
 
-    # --- Passive advertisement handler -----------------------------------
-
     @callback
     def _handle_advertisement(
         self,
         service_info: bluetooth.BluetoothServiceInfoBleak,
         _change: bluetooth.BluetoothChange,
     ) -> None:
-        """Track RSSI from advertisements — independent of GATT state."""
         if self.state.rssi != service_info.rssi:
             self.state.rssi = service_info.rssi
             self._notify_state_changed()
@@ -608,7 +670,6 @@ class AIPrimeHub:
     # --- Public control surface (stubs — PR-3c implements writes) --------
 
     async def async_set_channel(self, channel_id: int, value_device: int) -> None:
-        """STUB: real FSCI write lands in PR-3c."""
         if channel_id not in self.state.channels:
             _LOGGER.warning(
                 "AIPrimeHub %s: refusing to set unknown channel 0x%02X",
@@ -627,7 +688,6 @@ class AIPrimeHub:
         self._notify_state_changed()
 
     async def async_set_power(self, *, on: bool) -> None:
-        """STUB: PR-3c implements via per-channel writes."""
         if on:
             placeholder = 500
             for cid in self.state.channels:
@@ -664,13 +724,6 @@ class AIPrimeHub:
     # --- Internal helpers ------------------------------------------------
 
     def _initialize_channels(self) -> None:
-        """Seed state.channels with hardcoded defaults.
-
-        Replaced at runtime by `_async_discover_channels` once the BLE
-        connection is up, so these are only visible:
-          - Briefly during connect (before discovery runs)
-          - When discovery fails (the warning path)
-        """
         for cid in ALL_CHANNEL_IDS:
             self.state.channels[cid] = ChannelState(
                 channel_id=cid,
@@ -702,6 +755,5 @@ class AIPrimeHub:
 
 
 def get_hub(hass: HomeAssistant, entry: ConfigEntry) -> AIPrimeHub:
-    """Convenience accessor used by platform setup functions."""
     domain_data: dict[str, Any] = hass.data[DOMAIN][entry.entry_id]
     return domain_data["hub"]
