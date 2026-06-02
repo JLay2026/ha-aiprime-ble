@@ -11,22 +11,24 @@ PR-3a (2026-06-02) — adds READ-ONLY periodic state poll:
 PR-3b (2026-06-02) — small read + polish:
   - FSCI firmware read via GET ATTR_FIRMWARE_VERSION (11), populates
     state.firmware (lights up the existing Firmware sensor).
-  - First 5 connect attempts log at DEBUG instead of WARNING. HA boot
-    typically takes ~5-25s for the bluetooth integration to populate
-    its device cache, and the noisy "BLE device not found in cache;
-    will retry" stream during that window isn't actionable. Real
-    failures (after attempt 6 ≈ ~60s of sustained backoff) still
-    escalate to WARNING.
+  - First 5 connect attempts log at DEBUG instead of WARNING.
 
-Hot-fix (2026-06-02, rebased onto post-PR-3b main) — `_async_read_channel_state`
-now polls the correct attribute (1504) with the right encoding. PR-3a was
-polling attribute 1500 which empirically returns a 2-byte status word always
-equal to 0 — so the dashboard tiles all read 0% even when the schedule was
-driving the LEDs. The probe script (aiprime_channel_probe.py) confirmed 1504
-returns 4-byte uint32 LE in 0..20000. Channels 0x01 (fan) and 0x1E (likely
-Moonlight) return InvalidElement on this attribute — both are system-managed,
-not user-targetable; the poll silently skips them. See const.py for recorded
-findings.
+Hot-fix (2026-06-02, rebased onto post-PR-3b main) — channel-state poll
+now reads CHANNEL_STATE_ITEM_LEN (=4) bytes as uint32 LE at attribute 1504
+(was 2 bytes at 1500 — that's a status word, not brightness).
+
+Retry-with-backoff (2026-06-02, PR-3c precursor) — `_send_request` is now a
+retry wrapper around a single-attempt `_send_request_once`. Background:
+the ESP32-S3 BT proxy's Bluedroid stack drops payload-bearing notification
+fragments from AI Prime's Qualcomm QCA4020 controller at a ~70% rate even
+after PSRAM enablement (see [[aiprime-bt-proxy-acl-fragmentation]] memory).
+A single FSCI round-trip therefore has ~28% success against this device.
+With 3 attempts at 5s/3s/3s timeouts and 0.5s/1.0s backoffs:
+  - Per-call success: 1 - 0.72^3 ≈ 63%
+  - Per-channel success across 2 poll cycles: 1 - 0.37^2 ≈ 86%
+  - Per-channel success across 3 cycles: 94%
+Each attempt uses a FRESH msg_id (builder is invoked per attempt) so a
+late response to a timed-out attempt doesn't shadow a fresh request.
 
 Reconnect topology: one long-running `_connect_with_retry` task per
 "connection epoch". The task loops with exponential backoff until a connect
@@ -40,7 +42,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothCallbackMatcher
@@ -92,7 +94,12 @@ from .types import ChannelState, DeviceState
 _LOGGER = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT_S = 5.0
+_RETRY_TIMEOUT_S = 3.0
+_RETRY_BACKOFFS_S: tuple[float, ...] = (0.5, 1.0)
+_DEFAULT_RETRIES = 2
 _QUIET_CONNECT_ATTEMPTS = 5
+
+_FrameBuilder = Callable[[], "tuple[int, bytes]"]
 
 
 class AIPrimeHub:
@@ -317,15 +324,73 @@ class AIPrimeHub:
         future = self._in_flight.get(msg_id)
         if future is None or future.done():
             _LOGGER.debug(
-                "AIPrimeHub %s: unmatched RX msg_id=%d: %s",
+                "AIPrimeHub %s: unmatched RX msg_id=%d: %s (likely late "
+                "reply to a timed-out attempt; safe to ignore)",
                 self.address, msg_id, to_hex(frame),
             )
             return
         future.set_result(frame)
 
     async def _send_request(
-        self, msg_id: int, frame: bytes, timeout: float = _REQUEST_TIMEOUT_S
+        self,
+        builder: _FrameBuilder,
+        *,
+        retries: int = _DEFAULT_RETRIES,
+        first_timeout: float = _REQUEST_TIMEOUT_S,
+        retry_timeout: float = _RETRY_TIMEOUT_S,
     ) -> bytes | None:
+        """Send an FSCI request with retry-with-backoff on timeout.
+
+        BT proxy ACL fragmentation drops ~70% of payload-bearing
+        notifications even after PSRAM enablement (see
+        [[aiprime-bt-proxy-acl-fragmentation]]). Three attempts with
+        0.5s/1.0s backoffs turn ~30% per-attempt success into ~63%
+        per-call success, compounding to ~94% across 3 poll cycles.
+
+        Each attempt invokes `builder()` fresh so a late response to a
+        timed-out attempt is discarded (logged as unmatched RX) rather
+        than shadowing the new request.
+
+        Stops retrying immediately on BLE disconnect — the reconnect
+        loop will restart the connection epoch and a future poll cycle
+        will re-attempt.
+        """
+        last_msg_id = -1
+        for attempt in range(retries + 1):
+            msg_id, frame = builder()
+            last_msg_id = msg_id
+            timeout = first_timeout if attempt == 0 else retry_timeout
+            reply = await self._send_request_once(msg_id, frame, timeout)
+            if reply is not None:
+                if attempt > 0:
+                    _LOGGER.debug(
+                        "AIPrimeHub %s: FSCI request succeeded on attempt "
+                        "%d/%d (msg_id=%d)",
+                        self.address, attempt + 1, retries + 1, msg_id,
+                    )
+                return reply
+            if attempt >= retries:
+                break
+            if not self.state.ble_connected:
+                _LOGGER.debug(
+                    "AIPrimeHub %s: FSCI request msg_id=%d skipping "
+                    "remaining %d retries (disconnected)",
+                    self.address, msg_id, retries - attempt,
+                )
+                break
+            backoff = _RETRY_BACKOFFS_S[min(attempt, len(_RETRY_BACKOFFS_S) - 1)]
+            await asyncio.sleep(backoff)
+        _LOGGER.warning(
+            "AIPrimeHub %s: FSCI request exhausted %d attempts "
+            "(last msg_id=%d)",
+            self.address, retries + 1, last_msg_id,
+        )
+        return None
+
+    async def _send_request_once(
+        self, msg_id: int, frame: bytes, timeout: float
+    ) -> bytes | None:
+        """Single-attempt FSCI round-trip. Caller (`_send_request`) handles retries."""
         client = self._client
         if client is None or not client.is_connected:
             _LOGGER.debug(
@@ -340,7 +405,7 @@ class AIPrimeHub:
             await client.write_gatt_char(CHAR_TX_DATA, frame, response=False)
             return await asyncio.wait_for(future, timeout)
         except asyncio.TimeoutError:
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "AIPrimeHub %s: FSCI request msg_id=%d timed out after %.1fs",
                 self.address, msg_id, timeout,
             )
@@ -348,7 +413,7 @@ class AIPrimeHub:
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "AIPrimeHub %s: FSCI request msg_id=%d failed: %s",
                 self.address, msg_id, err,
             )
@@ -357,8 +422,9 @@ class AIPrimeHub:
             self._in_flight.pop(msg_id, None)
 
     async def _read_fsci_serial(self) -> None:
-        msg_id, frame = self._codec.build_get_attribute(ATTR_SERIAL)
-        reply = await self._send_request(msg_id, frame)
+        reply = await self._send_request(
+            lambda: self._codec.build_get_attribute(ATTR_SERIAL)
+        )
         if reply is None:
             return
         status = parse_response_status(reply)
@@ -388,8 +454,9 @@ class AIPrimeHub:
              0x04 0x02 0x01 0x01 → "4.2.1.1").
           3. Anything else → hex string for diagnostic visibility.
         """
-        msg_id, frame = self._codec.build_get_attribute(ATTR_FIRMWARE_VERSION)
-        reply = await self._send_request(msg_id, frame)
+        reply = await self._send_request(
+            lambda: self._codec.build_get_attribute(ATTR_FIRMWARE_VERSION)
+        )
         if reply is None:
             return
         status = parse_response_status(reply)
@@ -441,14 +508,15 @@ class AIPrimeHub:
         self.state.software_revision = info.software_revision
 
     async def _async_discover_channels(self) -> None:
-        msg_id, frame = self._codec.build_get_attribute(
-            ATTR_CHANNEL_LIST, instance=0, count=0xFF
+        reply = await self._send_request(
+            lambda: self._codec.build_get_attribute(
+                ATTR_CHANNEL_LIST, instance=0, count=0xFF
+            )
         )
-        reply = await self._send_request(msg_id, frame)
         if reply is None:
             _LOGGER.warning(
-                "AIPrimeHub %s: ATTR_CHANNEL_LIST read returned no frame; "
-                "keeping initialized channel set", self.address,
+                "AIPrimeHub %s: ATTR_CHANNEL_LIST read returned no frame "
+                "after retries; keeping initialized channel set", self.address,
             )
             return
         _LOGGER.debug(
@@ -511,15 +579,14 @@ class AIPrimeHub:
     async def _async_read_channel_state(self) -> None:
         """Per-channel GET ATTR_LIVE_CHANNEL_STATE; updates state.channels values.
 
-        Hot-fix 2026-06-02: reads CHANNEL_STATE_ITEM_LEN (=4) bytes as uint32 LE
-        and clamps to DEVICE_VALUE_MAX (=20000). PR-3a originally read 2 bytes
-        and clamped to 1000 per the per-mille assumption inherited from the
-        pump project — wrong for this product.
+        Each per-channel request now goes through `_send_request`'s retry
+        wrapper (3 attempts, 5s/3s/3s timeouts, 0.5s/1.0s backoffs). With
+        ~30% per-attempt success against the BT-proxy-induced fragmentation
+        loss, expect ~63% per-call success and ~94% across 3 poll cycles.
 
         Channels 0x01 (fan) and 0x1E (likely Moonlight) return InvalidElement
-        on the ATTR_LIVE_CHANNEL_STATE (1504) attribute — both are system-
-        managed, not user-targetable. Their state simply doesn't update from
-        this poll; that's intentional, not a bug.
+        on attribute 1504 — both are system-managed, not user-targetable.
+        Their state simply doesn't update from this poll; that's intentional.
         """
         if not self.state.channels:
             _LOGGER.debug(
@@ -530,10 +597,11 @@ class AIPrimeHub:
 
         any_updated = False
         for channel_id in list(self.state.channels):
-            msg_id, frame = self._codec.build_get_attribute(
-                ATTR_LIVE_CHANNEL_STATE, instance=channel_id, count=1
+            reply = await self._send_request(
+                lambda cid=channel_id: self._codec.build_get_attribute(
+                    ATTR_LIVE_CHANNEL_STATE, instance=cid, count=1
+                )
             )
-            reply = await self._send_request(msg_id, frame)
             if reply is None:
                 continue
             status = parse_response_status(reply)
