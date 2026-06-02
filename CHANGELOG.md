@@ -6,6 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — hot-fix (2026-06-02, rebased)
+- **Channel-state poll now reports real brightness values.** PR-3a's poll
+  was reading attribute `1500` (placeholder, marked "best guess from dump
+  — confirm"), which empirically returns a 2-byte status word always
+  equal to `0x0000` regardless of what the LED driver is doing. The
+  dashboard tiles consequently showed 0% on every channel even when the
+  light was visibly on.
+
+  `aiprime_channel_probe.py` (standalone bleak probe) queried all three
+  candidate attributes (`1500` / `1504` / `1513`) against all 7 discovered
+  channel IDs and confirmed:
+
+  - `1500` returns 2-byte `0x0000` for every channel → renamed to
+    `ATTR_CHANNEL_STATUS_WORD`; no longer used by the poll.
+  - `1504` returns 4-byte uint32 LE in `0..~20000` that matches what the
+    LED driver is actually outputting → this is now `ATTR_LIVE_CHANNEL_STATE`.
+  - `1513` mirrors `1504` (likely an alias until someone writes).
+  - `0x01` (fan) and `0x1E` return `InvalidElement` on `1504` — both are
+    system-managed, not user-targetable. Fan makes sense; `0x1E` being
+    unsettable strongly hints that `0x1E` IS Moonlight (schedule-only)
+    rather than the Cool White the heuristic dashboard labels assumed.
+
+- **Value scale `DEVICE_VALUE_MAX` changed `1000` → `20000`.** Reflects
+  the actual wire range. `percent_to_device` / `device_to_percent` updated
+  to match. State storage interpretation: `state.channels[cid].value_device`
+  now holds raw device units (0..20000) rather than per-mille (0..1000).
+- **`_async_read_channel_state` reads 4 bytes as uint32 LE** (was 2 bytes
+  as uint16 LE). Item-length check raised from `len(raw) < 2` to
+  `len(raw) < CHANNEL_STATE_ITEM_LEN` (=4).
+- **`manifest.json`:** version `0.1.1` → `0.1.2`. Patch bump — bug fix.
+  Originally proposed in PR #9 as `0.1.0 → 0.1.1`, but PR-3b merged first
+  and took `0.1.1`, so this rebased hot-fix lands on top of `0.1.1` and
+  bumps to `0.1.2`.
+
+### Notes — hot-fix
+- The probe also surfaced the likely Moonlight ID confusion (`0x1E`
+  unsettable suggests Moonlight, not Cool White). The dashboard label
+  fix-up in `home-assistant-config` should swap `0x16 → Moonlight` for
+  `0x1E → Moonlight` (and reassign `0x16` to one of the other colors)
+  in a follow-up. Not done here to keep the hot-fix narrowly scoped to
+  the integration repo.
+
 ### Added — Day 4 PR-3b (2026-06-02)
 - **FSCI firmware sensor.** `_read_fsci_firmware()` rounds-trip
   `GET ATTR_FIRMWARE_VERSION (11)` at connect and populates
@@ -135,7 +177,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   discovered during Day 3 validation. Purpose TBD; held for future PRs.
 
 ### Pending (Day 4 PR-3c — first mutating write)
-- Real `async_set_channel` via lifted FSCI codec.
+- Real `async_set_channel` via lifted FSCI codec. Now that the value scale is
+  known (`0..20000`), the write path will use `percent_to_device` to translate
+  user-facing 0-100% into the right raw value.
 - Post-write re-poll to confirm device state.
 - Verify `instance=channel_id` is correct vs. positional indexing.
 
