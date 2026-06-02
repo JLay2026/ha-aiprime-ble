@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Day 4 PR-3b (2026-06-02)
+- **FSCI firmware sensor.** `_read_fsci_firmware()` rounds-trip
+  `GET ATTR_FIRMWARE_VERSION (11)` at connect and populates
+  `state.firmware` — lights up the existing `Firmware version` sensor
+  that was permanently `unavailable` until now. Decode strategy is
+  best-effort with three fallbacks (printable ASCII → packed version
+  bytes joined with `.` → hex string for diagnostic visibility). Raw
+  payload is logged at DEBUG either way.
+
+### Changed — Day 4 PR-3b
+- **`Model number` sensor renamed to `Build version`.** AI populates the
+  standard 0x180A 2A24 (Model Number) characteristic with what looks
+  like a version string (PR-3a smoke test showed `4.2.1.1`) rather than
+  a model name. The new label is honest about the actual content.
+  Entity_id and unique_id are preserved — dashboards and automations
+  keyed on the entity_id continue to work unchanged.
+- **Connect-failure log noise reduced.** The first 5 `_async_connect`
+  attempts now log at DEBUG instead of WARNING. The HA `bluetooth`
+  integration typically needs ~5-25s after `aiprime_ble` loads to
+  populate its device cache, and the noisy `BLE device not found in
+  cache; will retry` stream during that window isn't actionable.
+  Sustained failures (after attempt 6 ≈ ~60s of backoff) still escalate
+  to WARNING. Disconnect callback resets the attempt counter so a
+  reconnect epoch also gets the quiet window. PR-2 smoke test surfaced
+  this issue.
+- **`manifest.json`:** version `0.1.0` → `0.1.1`. Patch bump — additive
+  feature (firmware sensor) + polish (log noise, sensor label).
+- **Connect INFO log extended** to show both firmware sources side by
+  side: `... build=4.2.1.1 fw_di=1.0 fw_fsci=<FSCI value> ...`.
+
+### Notes — Day 4 PR-3b
+- No mutating writes — `async_set_channel` / `async_set_power` remain
+  stubs. PR-3c implements the first real write.
+- If `ATTR_FIRMWARE_VERSION` returns nothing or fails, the existing
+  `Firmware version` sensor stays `unavailable` — no behavior change
+  from before.
+
 ### Added — Day 4 PR-3a (2026-06-02)
 - **Device-side channel discovery.** `_async_discover_channels()` GETs
   `ATTR_CHANNEL_LIST` (901) at connect and rebuilds `state.channels` from the
@@ -33,18 +70,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - If `ATTR_CHANNEL_LIST` returns nothing (timeout, malformed, or empty), the
   hub keeps the hardcoded defaults from `_initialize_channels` rather than
   going silent. WARNING-level log makes this visible.
-- Channel-list parsing assumes one byte per entry. If MOBIUS packs (id +
-  metadata) bytes per entry, the DEBUG hex dump will reveal it and we
-  adjust in a fix-up.
-
-### Pending (Day 4 PR-3b — FSCI firmware read)
-- `_read_fsci_firmware()` to populate `state.firmware` from
-  `ATTR_FIRMWARE_VERSION (11)`.
-
-### Pending (Day 4 PR-3c — first mutating write)
-- Real `async_set_channel` via lifted FSCI codec.
-- Post-write re-poll to confirm device state.
-- Verify `instance=channel_id` is correct vs. positional indexing.
+- Channel-list parsing assumes one byte per entry. PR-3a smoke test (logged
+  2026-06-02) confirmed this assumption holds for AI Prime 16 Freshwater —
+  device returned exactly the 7 hardcoded IDs `0x01, 0x10, 0x11, 0x13, 0x16,
+  0x19, 0x1E` (disproving the earlier "channel 7 might be Moonlight"
+  hypothesis).
 
 ### Added — Day 4 PR-2 (2026-06-02)
 - **Real BLE connection lifecycle** in `aiprime_hub.py`:
@@ -103,6 +133,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **0x180A char UUID constants** + `SERVICE_DEVICE_INFO` in `const.py`.
 - **`CHAR_AUX = 01ff0105-…`** constant for the 5th proprietary GATT char
   discovered during Day 3 validation. Purpose TBD; held for future PRs.
+
+### Pending (Day 4 PR-3c — first mutating write)
+- Real `async_set_channel` via lifted FSCI codec.
+- Post-write re-poll to confirm device state.
+- Verify `instance=channel_id` is correct vs. positional indexing.
 
 ### Pending (Day 5 — per-channel sliders + channel-name discovery)
 - `number.py` per-channel sliders connected to `async_set_channel`.
