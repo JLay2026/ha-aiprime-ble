@@ -5,15 +5,15 @@ lifecycle (connect/disconnect, RX dispatch, post-connect ATTR_SERIAL + 0x180A
 reads, passive RSSI tracking, reconnect loop with exponential backoff).
 
 PR-3a (2026-06-02) — adds READ-ONLY periodic state poll:
-  - Channel-list DISCOVERY at connect via GET ATTR_CHANNEL_LIST (901). The
-    device's canonical channel set replaces our hardcoded ALL_CHANNEL_IDS
-    at runtime. If discovery returns nothing the hub leaves the initialized
-    defaults in place and logs a warning (no fallback guessing).
-  - Per-channel GET ATTR_LIVE_CHANNEL_STATE(channel_id) at connect plus
-    every DEFAULT_STATE_POLL_INTERVAL_S afterwards. Lock-guarded so polls
-    don't overlap; skipped silently when disconnected.
-  - No mutating writes — async_set_channel / async_set_power remain stubs.
-    PR-3c implements the first real write.
+  - Channel-list DISCOVERY at connect via GET ATTR_CHANNEL_LIST (901).
+  - Per-channel GET ATTR_LIVE_CHANNEL_STATE(channel_id) every 30s.
+
+Hot-fix (2026-06-02) — `_async_read_channel_state` now polls the correct
+attribute (1504) with the right encoding. PR-3a was polling attribute 1500
+which empirically returns a 2-byte status word always equal to 0 — so the
+dashboard tiles all read 0% even when the schedule was driving the LEDs.
+The probe script (aiprime_channel_probe.py) confirmed 1504 returns 4-byte
+uint32 LE in 0..20000. See const.py for the recorded findings.
 
 Reconnect topology: one long-running `_connect_with_retry` task per
 "connection epoch". The task loops with exponential backoff until a connect
@@ -50,6 +50,7 @@ from .const import (
     ATTR_SERIAL,
     CHANNEL_DEFAULT_LABELS,
     CHANNEL_ID_FAN,
+    CHANNEL_STATE_ITEM_LEN,
     CHAR_RX_DATA,
     CHAR_RX_FINAL,
     CHAR_TX_DATA,
@@ -58,6 +59,7 @@ from .const import (
     DEFAULT_RECONNECT_BACKOFF_CAP_S,
     DEFAULT_RECONNECT_BACKOFF_INITIAL_S,
     DEFAULT_STATE_POLL_INTERVAL_S,
+    DEVICE_VALUE_MAX,
     DOMAIN,
     SIGNAL_AVAILABILITY,
     SIGNAL_STATE_UPDATED,
@@ -91,30 +93,23 @@ class AIPrimeHub:
         self.state = DeviceState(address=self.address, name=self.name)
         self._initialize_channels()
 
-        # FSCI protocol machinery
         self._codec = FsciCodec()
         self._client: BleakClientWithServiceCache | None = None
         self._rx_buffer = bytearray()
         self._in_flight: dict[int, asyncio.Future[bytes]] = {}
 
-        # Connection lifecycle
         self._connect_lock = asyncio.Lock()
         self._connect_task: asyncio.Task[None] | None = None
         self._reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF_INITIAL_S
         self._intentional_disconnect: bool = False
 
-        # State poll (PR-3a)
         self._poll_lock = asyncio.Lock()
 
-    # --- HA lifecycle -----------------------------------------------------
-
     async def async_setup(self) -> None:
-        """Register passive RSSI tracking + periodic state poll, then connect."""
         if not self.address:
             _LOGGER.error("AIPrimeHub setup: no CONF_ADDRESS in entry data")
             return
 
-        # Passive RSSI tracking — works even when GATT is down.
         unsub_rssi = bluetooth.async_register_callback(
             self.hass,
             self._handle_advertisement,
@@ -123,9 +118,6 @@ class AIPrimeHub:
         )
         self.entry.async_on_unload(unsub_rssi)
 
-        # Periodic state poll (PR-3a). Initial snapshot happens inline in
-        # _async_connect so first values land within ~5s of connect; this
-        # schedule keeps them fresh thereafter.
         unsub_poll = async_track_time_interval(
             self.hass,
             self._async_poll_state_callback,
@@ -133,12 +125,9 @@ class AIPrimeHub:
         )
         self.entry.async_on_unload(unsub_poll)
 
-        # Kick off the first connect attempt in the background — don't block
-        # entry setup on BLE since the device may be temporarily out of range.
         self._spawn_connect_task()
 
     async def async_unload(self) -> None:
-        """Tear down: cancel reconnect loop, disconnect cleanly."""
         self._intentional_disconnect = True
         if self._connect_task and not self._connect_task.done():
             self._connect_task.cancel()
@@ -148,20 +137,14 @@ class AIPrimeHub:
                 pass
         await self._async_disconnect()
 
-    # --- Connection management -------------------------------------------
-
     def _spawn_connect_task(self) -> None:
-        """Spawn a fresh `_connect_with_retry` loop if none is already running."""
         if self._intentional_disconnect:
             return
         if self._connect_task and not self._connect_task.done():
             return
-        self._connect_task = self.hass.async_create_task(
-            self._connect_with_retry()
-        )
+        self._connect_task = self.hass.async_create_task(self._connect_with_retry())
 
     async def _connect_with_retry(self) -> None:
-        """Loop until connected (or until unload marks intentional disconnect)."""
         attempt = 0
         while not self._intentional_disconnect:
             attempt += 1
@@ -172,26 +155,19 @@ class AIPrimeHub:
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning(
                     "AIPrimeHub %s: connect attempt %d errored: %s",
-                    self.address,
-                    attempt,
-                    err,
+                    self.address, attempt, err,
                 )
 
             if self.state.ble_connected:
                 return
-
             if self._intentional_disconnect:
                 return
 
             delay = self._reconnect_backoff
-            self._reconnect_backoff = min(
-                delay * 2, DEFAULT_RECONNECT_BACKOFF_CAP_S
-            )
+            self._reconnect_backoff = min(delay * 2, DEFAULT_RECONNECT_BACKOFF_CAP_S)
             _LOGGER.debug(
                 "AIPrimeHub %s: reconnect attempt %d in %.1fs",
-                self.address,
-                attempt + 1,
-                delay,
+                self.address, attempt + 1, delay,
             )
             try:
                 await asyncio.sleep(delay)
@@ -199,7 +175,6 @@ class AIPrimeHub:
                 raise
 
     async def _async_connect(self) -> None:
-        """One connect attempt: resolve BLEDevice, open GATT, post-connect reads."""
         async with self._connect_lock:
             if self._client and self._client.is_connected:
                 return
@@ -212,8 +187,7 @@ class AIPrimeHub:
             if ble_device is None:
                 _LOGGER.warning(
                     "AIPrimeHub %s: BLE device not found in HA bluetooth "
-                    "cache; will retry",
-                    self.address,
+                    "cache; will retry", self.address,
                 )
                 return
 
@@ -249,16 +223,9 @@ class AIPrimeHub:
             self.state.ble_connected = True
             self._reconnect_backoff = DEFAULT_RECONNECT_BACKOFF_INITIAL_S
 
-            # FSCI smoke test: GET ATTR_SERIAL(3). Same query as Day 3.
             await self._read_fsci_serial()
-
-            # PR-3a: discover the real channel set from the device.
             await self._async_discover_channels()
-
-            # PR-3a: initial channel state snapshot.
             await self._async_read_channel_state()
-
-            # Standard 0x180A device info — best-effort, never aborts setup.
             await self._read_device_info(client)
 
             self._notify_availability_changed()
@@ -275,7 +242,6 @@ class AIPrimeHub:
             )
 
     async def _async_disconnect(self) -> None:
-        """Drop the GATT link, cancel pending requests, mark unavailable."""
         client = self._client
         self._client = None
         was_connected = self.state.ble_connected
@@ -290,17 +256,13 @@ class AIPrimeHub:
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug(
                     "AIPrimeHub %s: disconnect error (ignored): %s",
-                    self.address,
-                    err,
+                    self.address, err,
                 )
         if was_connected:
             self._notify_availability_changed()
 
     def _handle_disconnected(self, _client: Any) -> None:
-        """bleak-side callback when the GATT link drops."""
-        _LOGGER.debug(
-            "AIPrimeHub %s: bleak disconnected callback", self.address
-        )
+        _LOGGER.debug("AIPrimeHub %s: bleak disconnected callback", self.address)
         self.state.ble_connected = False
         for future in list(self._in_flight.values()):
             if not future.done():
@@ -310,8 +272,6 @@ class AIPrimeHub:
         if not self._intentional_disconnect:
             self._reconnect_backoff = DEFAULT_RECONNECT_BACKOFF_INITIAL_S
             self._spawn_connect_task()
-
-    # --- RX path (BLE notifications) -------------------------------------
 
     def _on_rx_data(self, _ch: Any, data: bytearray) -> None:
         self._rx_buffer.extend(data)
@@ -323,8 +283,7 @@ class AIPrimeHub:
         if len(frame) < 5:
             _LOGGER.debug(
                 "AIPrimeHub %s: RX frame too short to dispatch: %s",
-                self.address,
-                to_hex(frame),
+                self.address, to_hex(frame),
             )
             return
         msg_id = frame[3] | (frame[4] << 8)
@@ -332,14 +291,10 @@ class AIPrimeHub:
         if future is None or future.done():
             _LOGGER.debug(
                 "AIPrimeHub %s: unmatched RX msg_id=%d: %s",
-                self.address,
-                msg_id,
-                to_hex(frame),
+                self.address, msg_id, to_hex(frame),
             )
             return
         future.set_result(frame)
-
-    # --- TX path (FSCI requests) -----------------------------------------
 
     async def _send_request(
         self, msg_id: int, frame: bytes, timeout: float = _REQUEST_TIMEOUT_S
@@ -360,9 +315,7 @@ class AIPrimeHub:
         except asyncio.TimeoutError:
             _LOGGER.warning(
                 "AIPrimeHub %s: FSCI request msg_id=%d timed out after %.1fs",
-                self.address,
-                msg_id,
-                timeout,
+                self.address, msg_id, timeout,
             )
             return None
         except asyncio.CancelledError:
@@ -370,15 +323,11 @@ class AIPrimeHub:
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
                 "AIPrimeHub %s: FSCI request msg_id=%d failed: %s",
-                self.address,
-                msg_id,
-                err,
+                self.address, msg_id, err,
             )
             return None
         finally:
             self._in_flight.pop(msg_id, None)
-
-    # --- Post-connect reads ----------------------------------------------
 
     async def _read_fsci_serial(self) -> None:
         msg_id, frame = self._codec.build_get_attribute(ATTR_SERIAL)
@@ -425,19 +374,7 @@ class AIPrimeHub:
         self.state.firmware_revision = info.firmware_revision
         self.state.software_revision = info.software_revision
 
-    # --- PR-3a: channel discovery + state poll ---------------------------
-
     async def _async_discover_channels(self) -> None:
-        """GET ATTR_CHANNEL_LIST(901), rebuild state.channels from device data.
-
-        If the read fails or returns nothing, leave the initialized defaults
-        in place and log a warning. We do NOT fall back to guessing — the
-        user's choice during PR-3a planning was "trust the device".
-
-        Channel-list payload format is unverified — assumed to be one byte
-        per channel ID. The raw reply is logged at DEBUG so we can adjust
-        parsing if the smoke test reveals a different shape.
-        """
         msg_id, frame = self._codec.build_get_attribute(
             ATTR_CHANNEL_LIST, instance=0, count=0xFF
         )
@@ -445,14 +382,12 @@ class AIPrimeHub:
         if reply is None:
             _LOGGER.warning(
                 "AIPrimeHub %s: ATTR_CHANNEL_LIST read returned no frame; "
-                "keeping initialized channel set",
-                self.address,
+                "keeping initialized channel set", self.address,
             )
             return
         _LOGGER.debug(
             "AIPrimeHub %s: ATTR_CHANNEL_LIST raw reply: %s",
-            self.address,
-            to_hex(reply),
+            self.address, to_hex(reply),
         )
         status = parse_response_status(reply)
         if status != STATUS_SUCCESS:
@@ -466,21 +401,14 @@ class AIPrimeHub:
         if not values:
             _LOGGER.warning(
                 "AIPrimeHub %s: ATTR_CHANNEL_LIST parsed empty value list; "
-                "keeping initialized channel set",
-                self.address,
+                "keeping initialized channel set", self.address,
             )
             return
         _LOGGER.debug(
             "AIPrimeHub %s: ATTR_CHANNEL_LIST parsed %d entries: %s",
-            self.address,
-            len(values),
-            [v.hex() for v in values],
+            self.address, len(values), [v.hex() for v in values],
         )
 
-        # Each value is assumed to contain at least one byte = channel ID.
-        # If the device packs multiple bytes per entry (e.g., id + metadata),
-        # the first byte is still the ID — adjust here if smoke test reveals
-        # otherwise.
         discovered: list[int] = []
         for raw in values:
             if not raw:
@@ -490,13 +418,10 @@ class AIPrimeHub:
         if not discovered:
             _LOGGER.warning(
                 "AIPrimeHub %s: ATTR_CHANNEL_LIST extracted no channel IDs; "
-                "keeping initialized channel set",
-                self.address,
+                "keeping initialized channel set", self.address,
             )
             return
 
-        # Rebuild state.channels from the discovered list, preserving values
-        # of any channel we already had.
         new_channels: dict[int, ChannelState] = {}
         for cid in discovered:
             existing = self.state.channels.get(cid)
@@ -513,18 +438,24 @@ class AIPrimeHub:
             _LOGGER.info(
                 "AIPrimeHub %s: discovered %d channels including %d "
                 "without default labels: %s",
-                self.address,
-                len(discovered),
-                len(unknown),
+                self.address, len(discovered), len(unknown),
                 ", ".join(f"0x{cid:02X}" for cid in unknown),
             )
 
     async def _async_read_channel_state(self) -> None:
         """Per-channel GET ATTR_LIVE_CHANNEL_STATE; updates state.channels values.
 
-        One round-trip per channel keeps the parsing simple (single-instance
-        responses, well-tested code path). At 7 channels × ~50ms each that's
-        ~350ms per poll cycle — well within the 30s poll interval.
+        Hot-fix 2026-06-02: reads CHANNEL_STATE_ITEM_LEN (=4) bytes as uint32 LE
+        and clamps to DEVICE_VALUE_MAX (=20000). PR-3a originally read 2 bytes
+        and clamped to 1000 per the per-mille assumption inherited from the
+        pump project — wrong for this product. See const.py "Channel state
+        attributes" block + CHANGELOG hot-fix entry for the probe data that
+        established the right encoding.
+
+        Channels 0x01 (fan) and 0x1E (likely Moonlight) return InvalidElement
+        on the ATTR_LIVE_CHANNEL_STATE (1504) attribute — both are system-
+        managed, not user-targetable. Their state simply doesn't update from
+        this poll; that's intentional, not a bug.
         """
         if not self.state.channels:
             _LOGGER.debug(
@@ -543,10 +474,12 @@ class AIPrimeHub:
                 continue
             status = parse_response_status(reply)
             if status != STATUS_SUCCESS:
+                # Expected for channels 0x01 (fan) and 0x1E (likely Moonlight);
+                # logged at DEBUG so it's visible during troubleshooting
+                # without spamming WARN-level for benign cases.
                 _LOGGER.debug(
                     "AIPrimeHub %s: channel 0x%02X state CONFIRM status=%s",
-                    self.address,
-                    channel_id,
+                    self.address, channel_id,
                     status_name(status) if status >= 0 else "MalformedFrame",
                 )
                 continue
@@ -554,16 +487,15 @@ class AIPrimeHub:
             if not values:
                 continue
             raw = values[0]
-            if len(raw) < 2:
+            if len(raw) < CHANNEL_STATE_ITEM_LEN:
                 _LOGGER.debug(
-                    "AIPrimeHub %s: channel 0x%02X value too short: %s",
-                    self.address,
-                    channel_id,
-                    to_hex(raw),
+                    "AIPrimeHub %s: channel 0x%02X value too short (got %d, need %d): %s",
+                    self.address, channel_id, len(raw),
+                    CHANNEL_STATE_ITEM_LEN, to_hex(raw),
                 )
                 continue
-            value = int.from_bytes(raw[:2], "little")
-            value = max(0, min(1000, value))
+            value = int.from_bytes(raw[:CHANNEL_STATE_ITEM_LEN], "little")
+            value = max(0, min(DEVICE_VALUE_MAX, value))
             cs = self.state.channels.get(channel_id)
             if cs is not None and cs.value_device != value:
                 cs.value_device = value
@@ -573,12 +505,9 @@ class AIPrimeHub:
             self._notify_state_changed()
 
     async def _async_poll_state_callback(self, _now: datetime | None = None) -> None:
-        """Periodic poll wrapper. Skipped if disconnected or already polling."""
         if not self.state.ble_connected:
             return
         if self._poll_lock.locked():
-            # A previous poll is still in flight; skip rather than queue up
-            # (queueing would risk overlapping reads if the device is slow).
             return
         async with self._poll_lock:
             try:
@@ -588,11 +517,8 @@ class AIPrimeHub:
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning(
                     "AIPrimeHub %s: periodic poll errored: %s",
-                    self.address,
-                    err,
+                    self.address, err,
                 )
-
-    # --- Passive advertisement handler -----------------------------------
 
     @callback
     def _handle_advertisement(
@@ -600,36 +526,29 @@ class AIPrimeHub:
         service_info: bluetooth.BluetoothServiceInfoBleak,
         _change: bluetooth.BluetoothChange,
     ) -> None:
-        """Track RSSI from advertisements — independent of GATT state."""
         if self.state.rssi != service_info.rssi:
             self.state.rssi = service_info.rssi
             self._notify_state_changed()
 
-    # --- Public control surface (stubs — PR-3c implements writes) --------
-
     async def async_set_channel(self, channel_id: int, value_device: int) -> None:
-        """STUB: real FSCI write lands in PR-3c."""
         if channel_id not in self.state.channels:
             _LOGGER.warning(
                 "AIPrimeHub %s: refusing to set unknown channel 0x%02X",
-                self.address,
-                channel_id,
+                self.address, channel_id,
             )
             return
-        clamped = max(0, min(1000, int(value_device)))
+        clamped = max(0, min(DEVICE_VALUE_MAX, int(value_device)))
         self.state.channels[channel_id].value_device = clamped
         _LOGGER.debug(
             "AIPrimeHub %s: STUB set channel 0x%02X -> %d (PR-3c will FSCI-write)",
-            self.address,
-            channel_id,
-            clamped,
+            self.address, channel_id, clamped,
         )
         self._notify_state_changed()
 
     async def async_set_power(self, *, on: bool) -> None:
-        """STUB: PR-3c implements via per-channel writes."""
         if on:
-            placeholder = 500
+            # 50% as placeholder — PR-3c will remember last-state.
+            placeholder = DEVICE_VALUE_MAX // 2
             for cid in self.state.channels:
                 if cid != CHANNEL_ID_FAN:
                     self.state.channels[cid].value_device = placeholder
@@ -639,12 +558,9 @@ class AIPrimeHub:
                     self.state.channels[cid].value_device = 0
         _LOGGER.debug(
             "AIPrimeHub %s: STUB set power=%s (PR-3c will FSCI-write)",
-            self.address,
-            on,
+            self.address, on,
         )
         self._notify_state_changed()
-
-    # --- Read helpers used by entities -----------------------------------
 
     def is_on(self) -> bool:
         return any(
@@ -661,16 +577,7 @@ class AIPrimeHub:
         ]
         return max(led_values) if led_values else 0
 
-    # --- Internal helpers ------------------------------------------------
-
     def _initialize_channels(self) -> None:
-        """Seed state.channels with hardcoded defaults.
-
-        Replaced at runtime by `_async_discover_channels` once the BLE
-        connection is up, so these are only visible:
-          - Briefly during connect (before discovery runs)
-          - When discovery fails (the warning path)
-        """
         for cid in ALL_CHANNEL_IDS:
             self.state.channels[cid] = ChannelState(
                 channel_id=cid,
