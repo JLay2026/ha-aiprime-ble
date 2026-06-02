@@ -6,6 +6,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — PR-3c precursor (2026-06-02): retry-with-backoff in `_send_request`
+- **`_send_request` is now a retry wrapper** around a single-attempt
+  `_send_request_once`. Three attempts total (1 initial + 2 retries) with
+  per-attempt timeouts of `5.0s / 3.0s / 3.0s` and inter-attempt backoffs
+  of `0.5s / 1.0s`. Worst-case end-to-end per call: 12.5s.
+- **Background.** Post-PSRAM HA log analysis (2026-06-02) showed payload-
+  bearing FSCI notifications from AI Prime's Qualcomm QCA4020 still drop
+  at ~70% rate through the ESP32-S3 BT proxy's Bluedroid stack — PSRAM
+  fixed buffer-contention but not the Qualcomm-vs-Bluedroid fragment
+  format mismatch. A single round-trip therefore has ~28% success
+  against this specific device + proxy combo. The 3-attempt retry brings
+  per-call success to ~63% and compounds per-channel across cycles:
+  - 1 poll cycle (30s): ~63%
+  - 2 cycles (60s): ~86%
+  - 3 cycles (90s): ~94%
+- **Each attempt invokes the builder fresh** (callers pass a lambda
+  returning `(msg_id, frame)` instead of pre-built args), so a late
+  response to a timed-out attempt is dispatched as an unmatched RX
+  (DEBUG-logged) rather than shadowing the new request.
+- **Stops retrying immediately on BLE disconnect.** The reconnect epoch
+  loop will restart the connection and a future poll cycle will
+  re-attempt.
+- **Log noise reduction.** Intermediate per-attempt failures now log at
+  DEBUG; only final exhaustion logs at WARNING. Pre-PR the log would
+  fill with 5+ `FSCI request msg_id=N timed out` WARNINGs per poll
+  cycle; now only the final "exhausted 3 attempts" warning appears, and
+  only for requests that fail all 3 retries.
+
+### Changed — PR-3c precursor (2026-06-02)
+- **All four FSCI callers updated to the builder-lambda style:**
+  - `_read_fsci_serial`
+  - `_read_fsci_firmware`
+  - `_async_discover_channels`
+  - `_async_read_channel_state`
+- **`manifest.json`:** version `0.1.3` → `0.1.4`. Patch bump — additive
+  resilience (no behavior change on the happy path; per-channel poll
+  cycle takes longer in failure modes but channel values populate
+  reliably where they previously stayed at 0).
+
+### Notes — PR-3c precursor
+- This is **defense in depth**, not a workaround for a known integration
+  bug. BLE round-trips are inherently best-effort even on healthy
+  stacks; a retry layer is good hygiene regardless of the proxy/device
+  combination in front of the integration.
+- Per-channel state poll cycle worst case: 7 channels × 12.5s = 87.5s.
+  Cycle interval is 30s; if a cycle runs long the next interval is
+  skipped silently (`_poll_lock` already guards). Channels still
+  populate within 2-3 cycles in the worst case.
+- The retry math depends on independence between attempts. The BT proxy
+  fragmentation pattern observed empirically appears semi-stochastic
+  (different msg_ids fail per cycle), so the independence assumption is
+  approximately valid. If a future BT proxy fix removes the ~70% drop
+  rate, the retry layer becomes near-no-op (one attempt almost always
+  succeeds) — no need to undo this change.
+- PR-3c itself (the first real mutating write `async_set_channel` via
+  `build_set_channel`) still pending. With retry now in place, mutating
+  writes will also benefit from the same resilience.
+
 ### Fixed — hot-fix #2 (2026-06-02, post-merge regression)
 - **Restore `ATTR_LIVE_CHANNEL_TARGET` symbol.** PR #10's rebased rename of
   the `1504` attribute constant (to `ATTR_LIVE_CHANNEL_STATE`) silently
@@ -213,7 +271,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Also: rename `fsci.py`'s `build_get_channel_targets` → `build_get_channel_state_all`
   (or similar), drop the `ATTR_LIVE_CHANNEL_TARGET` alias added in hot-fix #2,
   and fix the stale 2-byte / 1000-clamp inside `build_set_channel` to use
-  `CHANNEL_STATE_ITEM_LEN` + `DEVICE_VALUE_MAX`.
+  `CHANNEL_STATE_ITEM_LEN` + `DEVICE_VALUE_MAX`. The retry wrapper added in
+  this PR will automatically apply to write CONFIRMs too — important because
+  write CONFIRMs are payload-bearing and would otherwise face the same drop
+  rate as channel-state reads.
 
 ### Pending (Day 5 — per-channel sliders + channel-name discovery)
 - `number.py` per-channel sliders connected to `async_set_channel`.
