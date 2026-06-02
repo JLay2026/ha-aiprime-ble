@@ -1,10 +1,8 @@
 """Diagnostic sensors — RSSI, firmware, fan, and standard 0x180A metadata.
 
-The 0x180A-derived sensors (manufacturer, model, hardware/software revision,
-DI-side serial) are populated by `protocol.device_info.read_device_info()`
-once the BLE connection is up. Until PR-2 lands the connection lifecycle
-they'll all show as unavailable — same status as the existing firmware
-sensor, which has always been gated on `state.firmware` being populated.
+The 0x180A-derived sensors (manufacturer, build version, hardware/software
+revision, DI-side serial) are populated by
+`protocol.device_info.read_device_info()` once the BLE connection is up.
 """
 
 from __future__ import annotations
@@ -36,7 +34,7 @@ async def async_setup_entry(
             AIPrimeRssiSensor(hub),
             AIPrimeFirmwareSensor(hub),
             AIPrimeFanSpeedSensor(hub),
-            # 0x180A Device Information sensors — populated post-connect (PR-2)
+            # 0x180A Device Information sensors — populated post-connect.
             AIPrimeManufacturerSensor(hub),
             AIPrimeModelNumberSensor(hub),
             AIPrimeSerialNumberSensor(hub),
@@ -96,6 +94,13 @@ class AIPrimeRssiSensor(_AIPrimeSensorBase):
 
 
 class AIPrimeFirmwareSensor(_AIPrimeSensorBase):
+    """FSCI ATTR_FIRMWARE_VERSION (11). Populated by PR-3b's _read_fsci_firmware.
+
+    Distinct from `AIPrimeSoftwareRevisionSensor` (0x180A 2A28) and from the
+    `Build version` sensor (0x180A 2A24, which AI populates with version-like
+    strings such as "4.2.1.1").
+    """
+
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, hub: AIPrimeHub) -> None:
@@ -123,7 +128,7 @@ class AIPrimeFanSpeedSensor(_AIPrimeSensorBase):
 
 
 # ---------------------------------------------------------------------------
-# Standard 0x180A Device Information sensors (PR-1)
+# Standard 0x180A Device Information sensors
 # ---------------------------------------------------------------------------
 
 class _AIPrimeDeviceInfoSensor(_AIPrimeSensorBase):
@@ -146,10 +151,20 @@ class AIPrimeManufacturerSensor(_AIPrimeDeviceInfoSensor):
 
 
 class AIPrimeModelNumberSensor(_AIPrimeDeviceInfoSensor):
+    """0x180A 2A24 Model Number.
+
+    PR-3b polish (2026-06-02): AI populates this characteristic with what
+    looks like a version string (e.g. "4.2.1.1") rather than a model name —
+    so the friendly label is "Build version" to reflect the actual content.
+    The HA entity_id is preserved (`sensor.<device>_model_number`) so any
+    dashboards or automations keyed on the entity_id keep working. The
+    unique_id suffix `model_number` is also unchanged.
+    """
+
     _attribute_name = "model_number"
 
     def __init__(self, hub: AIPrimeHub) -> None:
-        super().__init__(hub, "model_number", "Model number")
+        super().__init__(hub, "model_number", "Build version")
 
 
 class AIPrimeSerialNumberSensor(_AIPrimeDeviceInfoSensor):
