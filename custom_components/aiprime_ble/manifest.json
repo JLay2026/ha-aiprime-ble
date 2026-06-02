@@ -8,9 +8,9 @@
   "integration_type": "device",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/JLay2026/ha-aiprime-ble/issues",
-  "requirements": [],
+  "requirements": ["bleak-retry-connector>=3.4.0"],
   "bluetooth": [
     {"local_name": "MOBIUS"}
   ],
-  "version": "0.0.1"
+  "version": "0.0.2"
 }
