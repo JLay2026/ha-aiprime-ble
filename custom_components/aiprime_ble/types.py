@@ -20,11 +20,21 @@ class DeviceState:
 
     address: str = ""               # BLE MAC, e.g. "1C:BC:EC:0A:E2:D0"
     name: str = ""                  # MOBIUS or user-set name
-    serial: str | None = None
-    firmware: str | None = None
+    serial: str | None = None       # FSCI ATTR_SERIAL (3) — proprietary serial string
+    firmware: str | None = None     # FSCI ATTR_FIRMWARE_VERSION (11)
     ble_connected: bool = False
     rssi: int | None = None
     channels: dict[int, ChannelState] = field(default_factory=dict)
+
+    # --- Standard 0x180A Device Information Service fields ---------------
+    # Populated once after BLE connect via protocol.device_info.read_device_info().
+    # All optional per the BLE spec — missing chars yield None.
+    manufacturer: str | None = None
+    model_number: str | None = None
+    serial_number: str | None = None       # 0x180A 2A25 — may differ from FSCI serial
+    hardware_revision: str | None = None
+    firmware_revision: str | None = None   # 0x180A 2A26 — may differ from FSCI firmware
+    software_revision: str | None = None
 
     def channel(self, channel_id: int) -> ChannelState | None:
         return self.channels.get(channel_id)
