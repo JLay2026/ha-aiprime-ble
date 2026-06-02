@@ -1,4 +1,11 @@
-"""Diagnostic sensors — RSSI, firmware, fan."""
+"""Diagnostic sensors — RSSI, firmware, fan, and standard 0x180A metadata.
+
+The 0x180A-derived sensors (manufacturer, model, hardware/software revision,
+DI-side serial) are populated by `protocol.device_info.read_device_info()`
+once the BLE connection is up. Until PR-2 lands the connection lifecycle
+they'll all show as unavailable — same status as the existing firmware
+sensor, which has always been gated on `state.firmware` being populated.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +36,12 @@ async def async_setup_entry(
             AIPrimeRssiSensor(hub),
             AIPrimeFirmwareSensor(hub),
             AIPrimeFanSpeedSensor(hub),
+            # 0x180A Device Information sensors — populated post-connect (PR-2)
+            AIPrimeManufacturerSensor(hub),
+            AIPrimeModelNumberSensor(hub),
+            AIPrimeSerialNumberSensor(hub),
+            AIPrimeHardwareRevisionSensor(hub),
+            AIPrimeSoftwareRevisionSensor(hub),
         ]
     )
 
@@ -107,3 +120,56 @@ class AIPrimeFanSpeedSensor(_AIPrimeSensorBase):
         if ch is None:
             return None
         return device_to_percent(ch.value_device)
+
+
+# ---------------------------------------------------------------------------
+# Standard 0x180A Device Information sensors (PR-1)
+# ---------------------------------------------------------------------------
+
+class _AIPrimeDeviceInfoSensor(_AIPrimeSensorBase):
+    """Base for sensors backed by a single 0x180A characteristic."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    _attribute_name: str = ""  # subclasses override
+
+    @property
+    def native_value(self) -> str | None:
+        return getattr(self._hub.state, self._attribute_name, None)
+
+
+class AIPrimeManufacturerSensor(_AIPrimeDeviceInfoSensor):
+    _attribute_name = "manufacturer"
+
+    def __init__(self, hub: AIPrimeHub) -> None:
+        super().__init__(hub, "manufacturer", "Manufacturer")
+
+
+class AIPrimeModelNumberSensor(_AIPrimeDeviceInfoSensor):
+    _attribute_name = "model_number"
+
+    def __init__(self, hub: AIPrimeHub) -> None:
+        super().__init__(hub, "model_number", "Model number")
+
+
+class AIPrimeSerialNumberSensor(_AIPrimeDeviceInfoSensor):
+    """Serial number from 0x180A 2A25. May differ from FSCI ATTR_SERIAL (3)."""
+
+    _attribute_name = "serial_number"
+
+    def __init__(self, hub: AIPrimeHub) -> None:
+        super().__init__(hub, "di_serial_number", "Serial number")
+
+
+class AIPrimeHardwareRevisionSensor(_AIPrimeDeviceInfoSensor):
+    _attribute_name = "hardware_revision"
+
+    def __init__(self, hub: AIPrimeHub) -> None:
+        super().__init__(hub, "hardware_revision", "Hardware revision")
+
+
+class AIPrimeSoftwareRevisionSensor(_AIPrimeDeviceInfoSensor):
+    _attribute_name = "software_revision"
+
+    def __init__(self, hub: AIPrimeHub) -> None:
+        super().__init__(hub, "software_revision", "Software revision")

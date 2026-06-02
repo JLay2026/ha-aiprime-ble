@@ -15,16 +15,32 @@ DEFAULT_CONNECT_TIMEOUT_S = 10.0
 # --- Platforms ------------------------------------------------------------
 PLATFORMS: list[str] = ["light", "number", "sensor"]
 
-# --- GATT (lifted from mpshevlotsky/ai-pump-feed-esp32 — to be verified ---
-# Day 3 of the project plan validates whether these UUIDs apply to the
-# lighting product as well. Same vendor, same chip family conventions
-# expected, but the Prime HD 16HD uses Qualcomm QCA4020 vs the pump's NXP.
+# --- Proprietary GATT (FSCI transport, lifted from pump project; validated
+# Day 3 against the AI Prime QCA4020 — bit-identical round-trip) -----------
 SERVICE_GENERAL = "01ff0100-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 SERVICE_OTAP = "01ff5550-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 CHAR_RX_DATA = "01ff0101-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 CHAR_RX_FINAL = "01ff0102-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 CHAR_TX_DATA = "01ff0103-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
 CHAR_TX_FINAL = "01ff0104-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
+# 5th characteristic discovered during Day 3; not in pump project's UUID list.
+# `[write-without-response, notify]`. Purpose TBD — candidates: bulk-write
+# streaming, push notifications, OTA fast path. Held here for future use.
+CHAR_AUX = "01ff0105-ba5e-f4ee-5ca1-eb1e5e4b1ce0"
+
+# --- Standard 0x180A Device Information Service ---------------------------
+# Read once at connect; populates DeviceState metadata fields. Each char is
+# optional per the BLE spec — missing chars yield None, not an error.
+SERVICE_DEVICE_INFO = "0000180a-0000-1000-8000-00805f9b34fb"
+CHAR_DI_MANUFACTURER = "00002a29-0000-1000-8000-00805f9b34fb"
+CHAR_DI_MODEL_NUMBER = "00002a24-0000-1000-8000-00805f9b34fb"
+CHAR_DI_SERIAL_NUMBER = "00002a25-0000-1000-8000-00805f9b34fb"
+CHAR_DI_HARDWARE_REV = "00002a27-0000-1000-8000-00805f9b34fb"
+CHAR_DI_FIRMWARE_REV = "00002a26-0000-1000-8000-00805f9b34fb"
+CHAR_DI_SOFTWARE_REV = "00002a28-0000-1000-8000-00805f9b34fb"
+CHAR_DI_SYSTEM_ID = "00002a23-0000-1000-8000-00805f9b34fb"
+CHAR_DI_REGULATORY_CERT = "00002a2a-0000-1000-8000-00805f9b34fb"
+CHAR_DI_PNP_ID = "00002a50-0000-1000-8000-00805f9b34fb"
 
 # --- Channel layout (from Mobius app Settings Dump, attribute 901) --------
 # 6 LED channels + 1 fan, value scale 0-1000 (per-mille).
@@ -77,8 +93,8 @@ def device_to_percent(value: int) -> float:
 
 
 # --- Known FSCI attribute IDs (read-only metadata) ------------------------
-ATTR_SERIAL = 3              # ASCII serial string
-ATTR_FIRMWARE_VERSION = 11   # placeholder; verify in protocol notes
+ATTR_SERIAL = 3              # ASCII serial string (validated Day 3: "A09F0AE2D0R1CF")
+ATTR_FIRMWARE_VERSION = 11   # placeholder; verify in PR-2 smoke test
 ATTR_TIMEZONE_POSIX = 205
 ATTR_TIMEZONE_NAME = 206
 ATTR_MESH_LOCAL_ADDRESSES = 1005
