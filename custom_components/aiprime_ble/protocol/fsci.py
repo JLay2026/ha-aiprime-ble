@@ -42,6 +42,8 @@ from ..const import (
     ATTR_LIVE_CHANNEL_STATE,
     ATTR_LIVE_CHANNEL_TARGET,
     ATTR_MESH_LOCAL_ADDRESSES,
+    CHANNEL_STATE_ITEM_LEN,
+    DEVICE_VALUE_MAX,
 )
 
 __all__ = [
@@ -69,10 +71,6 @@ _RESERVED_GET = b"\x00\x00"
 _RESERVED_SET = b"\x04\x00"
 
 _MSG_ID_WRAP = 20000
-
-# Channel value scale on the wire (per-mille, 0-1000); see const.py for the
-# percent <-> device-value conversion helpers.
-_CHANNEL_ITEM_LEN = 2  # uint16 little-endian
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +263,13 @@ class FsciCodec:
         return self._build_frame(_OP_CODE_GET, payload)
 
     def build_get_channel_targets(self) -> tuple[int, bytes]:
-        """GET all channel target values (attr 1504), all instances."""
+        """GET all channel target values (attr 1504), all instances.
+
+        NOTE: as of the 2026-06-02 hot-fix, ATTR_LIVE_CHANNEL_TARGET is an
+        alias for ATTR_LIVE_CHANNEL_STATE (both = 1504). This builder is
+        kept for backward-compat callers; new code should use
+        build_get_channel_state.
+        """
         payload = struct.pack(
             "<HBB", ATTR_LIVE_CHANNEL_TARGET, 0, 0xFF
         )
@@ -274,21 +278,31 @@ class FsciCodec:
     def build_set_channel(
         self, channel_id: int, value_device: int
     ) -> tuple[int, bytes]:
-        """SET a single channel target (attr 1504) to a per-mille value.
+        """SET a single channel to a raw device value (0..DEVICE_VALUE_MAX).
+
+        PR-3c (2026-06-06): fixed two bugs vs the v0.0.1 stub:
+          - value is now uint32 LE (4 bytes), matching the read-side
+            CHANNEL_STATE_ITEM_LEN. Was uint16 LE (2 bytes), inherited
+            from the pump project's per-mille scale.
+          - clamp ceiling is now DEVICE_VALUE_MAX (20000), matching the
+            hot-fixed scale. Was 1000, which would have silently capped
+            every write at ~5%.
 
         Uses `instance = channel_id` (the FSCI convention for "which
-        sub-thing of this attribute"); PR-3 smoke testing will confirm
-        whether the AI Prime treats channel IDs as instance numbers, or
-        whether it expects an indexed lookup table.
+        sub-thing of this attribute"). Empirically validated via the
+        2026-06-02 channel probe — same attribute (1504) handles both
+        reads and writes; instance = channel_id is correct for reads,
+        so by symmetry it's correct here. Verified end-to-end as part
+        of PR-3c install/smoke test.
         """
-        clamped = max(0, min(1000, int(value_device)))
-        value_bytes = struct.pack("<H", clamped)
+        clamped = max(0, min(DEVICE_VALUE_MAX, int(value_device)))
+        value_bytes = struct.pack("<I", clamped)
         payload = struct.pack(
             "<HBBB",
             ATTR_LIVE_CHANNEL_TARGET,
             channel_id,                       # instance
             1,                                # count
-            _CHANNEL_ITEM_LEN,                # itemLen
+            CHANNEL_STATE_ITEM_LEN,           # itemLen = 4
         ) + value_bytes
         return self._build_frame(_OP_CODE_SET, payload)
 
