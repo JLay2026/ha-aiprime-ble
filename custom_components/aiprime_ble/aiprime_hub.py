@@ -30,6 +30,19 @@ With 3 attempts at 5s/3s/3s timeouts and 0.5s/1.0s backoffs:
 Each attempt uses a FRESH msg_id (builder is invoked per attempt) so a
 late response to a timed-out attempt doesn't shadow a fresh request.
 
+PR-3c (2026-06-06) — first mutating writes:
+  - `async_set_channel` builds a real FSCI SET via codec.build_set_channel,
+    sends through _send_request retry wrapper, applies optimistic state
+    update with rollback on failure.
+  - `async_set_power` walks LED channels (skipping fan + known-unwritable
+    0x1E) and calls async_set_channel for each. "On" restores the last-
+    known nonzero value per channel, falling back to 50% if unknown.
+  - Periodic poll opportunistically populates _last_nonzero_values so
+    HA-initiated on/off restores values set by Mobius / schedule too.
+  - Known-unwritable channels (CHANNEL_ID_FAN, CHANNEL_ID_LIKELY_MOONLIGHT)
+    are silently skipped at DEBUG level — they return InvalidElement on
+    attribute 1504 by design (fan is auto-managed, 0x1E is schedule-only).
+
 Reconnect topology: one long-running `_connect_with_retry` task per
 "connection epoch". The task loops with exponential backoff until a connect
 succeeds, then exits. The bleak disconnect callback spawns a fresh task
@@ -99,6 +112,25 @@ _RETRY_BACKOFFS_S: tuple[float, ...] = (0.5, 1.0)
 _DEFAULT_RETRIES = 2
 _QUIET_CONNECT_ATTEMPTS = 5
 
+# PR-3c (2026-06-06): channels that are NOT user-writable per the 2026-06-02
+# channel-state probe (see const.py "Channel state attributes" comment).
+# Writes to these channels return InvalidElement on attribute 1504 by design:
+#   - 0x01 (fan): auto-managed by AI Prime's internal temperature control
+#   - 0x1E: empirically returns InvalidElement on writes; likely Moonlight,
+#     which is schedule-only on the AI Prime platform (not directly settable).
+# We silently skip writes to these channels rather than emit error noise.
+# When channel labeling is empirically corrected (future PR), reconsider
+# whether 0x1E should be filtered out at the entity-builder layer instead.
+_CHANNEL_ID_LIKELY_MOONLIGHT = 0x1E
+_UNWRITABLE_CHANNEL_IDS: frozenset[int] = frozenset(
+    {CHANNEL_ID_FAN, _CHANNEL_ID_LIKELY_MOONLIGHT}
+)
+
+# Fallback brightness for "Master ON" when we have no last-known value for
+# a channel (e.g., immediately after HA boot before the first periodic poll
+# captures the device's current state). 50% of full scale.
+_POWER_ON_FALLBACK_DEVICE_VALUE = DEVICE_VALUE_MAX // 2
+
 _FrameBuilder = Callable[[], "tuple[int, bytes]"]
 
 
@@ -125,6 +157,11 @@ class AIPrimeHub:
         self._connect_attempt: int = 0
 
         self._poll_lock = asyncio.Lock()
+
+        # PR-3c: track last-seen nonzero value per channel for "Master ON"
+        # restore. Populated by writes AND by periodic polls (so values set
+        # via Mobius / device schedule are also remembered).
+        self._last_nonzero_values: dict[int, int] = {}
 
     async def async_setup(self) -> None:
         if not self.address:
@@ -587,6 +624,11 @@ class AIPrimeHub:
         Channels 0x01 (fan) and 0x1E (likely Moonlight) return InvalidElement
         on attribute 1504 — both are system-managed, not user-targetable.
         Their state simply doesn't update from this poll; that's intentional.
+
+        PR-3c: when a nonzero value is read, opportunistically populate
+        _last_nonzero_values so a subsequent HA-initiated "Master ON" can
+        restore the channel to its actual prior brightness (including values
+        set by Mobius / device schedules, not just HA writes).
         """
         if not self.state.channels:
             _LOGGER.debug(
@@ -625,6 +667,8 @@ class AIPrimeHub:
                 continue
             value = int.from_bytes(raw[:CHANNEL_STATE_ITEM_LEN], "little")
             value = max(0, min(DEVICE_VALUE_MAX, value))
+            if value > 0:
+                self._last_nonzero_values[channel_id] = value
             cs = self.state.channels.get(channel_id)
             if cs is not None and cs.value_device != value:
                 cs.value_device = value
@@ -660,35 +704,112 @@ class AIPrimeHub:
             self._notify_state_changed()
 
     async def async_set_channel(self, channel_id: int, value_device: int) -> None:
+        """Write one channel's target brightness via FSCI SET.
+
+        PR-3c (2026-06-06): replaces the v0.0.1 stub. Strategy:
+          1. Validate (channel known, channel writable) — early returns for
+             skip cases.
+          2. Optimistic local-state update + notify so HA UI reacts instantly.
+          3. Send the FSCI SET via `_send_request` (retry wrapper).
+          4. On any failure (retry-exhausted / status != Success), revert the
+             local-state and notify again, leaving the slider showing reality.
+          5. On success, opportunistically remember the value for Master-ON
+             restore.
+
+        Caveat: rapid back-to-back writes on the same channel can race —
+        if write A and write B are both in flight, A's failure-revert can
+        revert B's optimistic state. Not a problem for typical slider use
+        (HA serializes per-entity service calls); revisit if it bites in
+        practice. See task notes for the deterministic fix (re-poll instead
+        of revert).
+        """
         if channel_id not in self.state.channels:
             _LOGGER.warning(
                 "AIPrimeHub %s: refusing to set unknown channel 0x%02X",
                 self.address, channel_id,
             )
             return
+        if channel_id in _UNWRITABLE_CHANNEL_IDS:
+            _LOGGER.debug(
+                "AIPrimeHub %s: skipping write to unwritable channel 0x%02X "
+                "(returns InvalidElement by design — fan / schedule-only)",
+                self.address, channel_id,
+            )
+            return
+
         clamped = max(0, min(DEVICE_VALUE_MAX, int(value_device)))
+        prev_value = self.state.channels[channel_id].value_device
+
+        # Optimistic update — HA UI sees the new value immediately.
         self.state.channels[channel_id].value_device = clamped
-        _LOGGER.debug(
-            "AIPrimeHub %s: STUB set channel 0x%02X -> %d (PR-3c will FSCI-write)",
-            self.address, channel_id, clamped,
-        )
         self._notify_state_changed()
 
-    async def async_set_power(self, *, on: bool) -> None:
-        if on:
-            placeholder = DEVICE_VALUE_MAX // 2
-            for cid in self.state.channels:
-                if cid != CHANNEL_ID_FAN:
-                    self.state.channels[cid].value_device = placeholder
-        else:
-            for cid in self.state.channels:
-                if cid != CHANNEL_ID_FAN:
-                    self.state.channels[cid].value_device = 0
-        _LOGGER.debug(
-            "AIPrimeHub %s: STUB set power=%s (PR-3c will FSCI-write)",
-            self.address, on,
+        reply = await self._send_request(
+            lambda: self._codec.build_set_channel(channel_id, clamped)
         )
-        self._notify_state_changed()
+        if reply is None:
+            _LOGGER.warning(
+                "AIPrimeHub %s: set channel 0x%02X to %d exhausted retries; "
+                "reverting local state to %d",
+                self.address, channel_id, clamped, prev_value,
+            )
+            self.state.channels[channel_id].value_device = prev_value
+            self._notify_state_changed()
+            return
+
+        status = parse_response_status(reply)
+        if status != STATUS_SUCCESS:
+            _LOGGER.warning(
+                "AIPrimeHub %s: set channel 0x%02X to %d CONFIRM status=%s; "
+                "reverting local state to %d",
+                self.address, channel_id, clamped,
+                status_name(status) if status >= 0 else "MalformedFrame",
+                prev_value,
+            )
+            self.state.channels[channel_id].value_device = prev_value
+            self._notify_state_changed()
+            return
+
+        # Success — remember the value for Master-ON restore.
+        if clamped > 0:
+            self._last_nonzero_values[channel_id] = clamped
+        _LOGGER.debug(
+            "AIPrimeHub %s: set channel 0x%02X to %d OK",
+            self.address, channel_id, clamped,
+        )
+
+    async def async_set_power(self, *, on: bool) -> None:
+        """Turn the fixture on/off by writing each writable LED channel.
+
+        PR-3c (2026-06-06): replaces the v0.0.1 stub. Writes are issued
+        sequentially via `async_set_channel` (which handles retries and
+        rollback per-channel). Fan and known-unwritable channels are
+        skipped by `async_set_channel` itself.
+
+        "On" semantics:
+          - Use the last-known nonzero value for each channel (captured
+            either from a prior HA write or from a periodic state poll
+            that observed Mobius / schedule-set brightness).
+          - Fall back to 50% of full scale if we've never seen the channel
+            nonzero (e.g., HA boot before the first successful poll).
+
+        "Off" semantics:
+          - Write 0 to every writable LED channel.
+        """
+        for channel_id in list(self.state.channels):
+            if channel_id in _UNWRITABLE_CHANNEL_IDS:
+                continue
+            if on:
+                target = self._last_nonzero_values.get(
+                    channel_id, _POWER_ON_FALLBACK_DEVICE_VALUE
+                )
+            else:
+                target = 0
+            await self.async_set_channel(channel_id, target)
+
+        _LOGGER.debug(
+            "AIPrimeHub %s: set power=%s complete", self.address, on
+        )
 
     def is_on(self) -> bool:
         return any(
