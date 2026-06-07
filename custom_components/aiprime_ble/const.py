@@ -129,25 +129,46 @@ ATTR_CHANNEL_LIST = 901
 #       only on AI Prime, not a directly-targetable channel. Dashboard
 #       label-mapping fix-up will likely swap 0x16 ↔ 0x1E for Moonlight vs
 #       (one of the white channels).
+#     - PR-3c (2026-06-07) update: WRITES to 1504 return status=SUCCESS
+#       round-tripping cleanly through the C6 proxy, but the device never
+#       physically applies the value. Confirms hypothesis that 1504 is a
+#       READ-ONLY view of the schedule's current driving value. The real
+#       write target is 1513 (see PR-3d below).
 #
 #   1513 (ATTR_LIVE_CHANNEL_LAST_SET):
 #     - 4-byte payload, returned identical values to 1504 across all
-#       channels. Likely an alias / mirror until someone writes.
+#       channels at probe time. Originally hypothesized as an alias /
+#       mirror "until someone writes" — PR-3d (2026-06-07) tests that
+#       hypothesis by routing all writes here.
 #
 ATTR_CHANNEL_STATUS_WORD = 1500   # 2-byte status flag; always 0 in current observations
-ATTR_LIVE_CHANNEL_STATE = 1504    # 4-byte uint32 LE; this is what the poll reads
-ATTR_LIVE_CHANNEL_LAST_SET = 1513 # 4-byte uint32 LE; mirrors LIVE_CHANNEL_STATE
+ATTR_LIVE_CHANNEL_STATE = 1504    # 4-byte uint32 LE; READ target for live state (read-only in practice)
+ATTR_LIVE_CHANNEL_LAST_SET = 1513 # 4-byte uint32 LE; WRITE target as of PR-3d
 ATTR_SCENES = 400
 ATTR_SCHEDULE = 500
 
-# Backward-compat alias for protocol/fsci.py's build_get_channel_targets and
-# build_set_channel — PR #10's rebased rename dropped this symbol but fsci.py
-# still imports it, causing ImportError at integration load. Both names point
-# at the same attribute (1504) which does double duty: reading current state
-# and writing target. PR-3c will rename the fsci.py builders + fix the
-# stale 2-byte/1000-clamp inside build_set_channel, and at that point this
-# alias can be removed.
-ATTR_LIVE_CHANNEL_TARGET = ATTR_LIVE_CHANNEL_STATE
+# Write target alias used by protocol/fsci.py's build_set_channel (and
+# the currently-unused build_get_channel_targets).
+#
+# PR-3d (2026-06-07): retargeted from ATTR_LIVE_CHANNEL_STATE (1504) ->
+# ATTR_LIVE_CHANNEL_LAST_SET (1513). Background: PR-3c writes to 1504
+# completed at the FSCI level (status=SUCCESS, ~100ms per channel via
+# C6 proxy) but the AI Prime never physically applied any value. The
+# probe noted 1513 "returned identical values to 1504 ... likely an
+# alias / mirror until someone writes" — PR-3d is the first write here.
+#
+# Reads continue via ATTR_LIVE_CHANNEL_STATE (1504) explicitly in
+# _async_read_channel_state — no read-path change. The unused
+# build_get_channel_targets helper now reads from 1513 instead of 1504,
+# but probe confirmed the two return identical values on read so this
+# is incidentally fine.
+#
+# If 1513 ALSO doesn't make writes physically apply, the next hypothesis
+# is schedule conflict (schedule overwrites the write on its next tick).
+# That would require Mobius to temporarily disable the schedule for
+# diagnostic, and ultimately Day 6+ HA-side schedule control as a
+# prerequisite to writes being useful in any realistic deployment.
+ATTR_LIVE_CHANNEL_TARGET = ATTR_LIVE_CHANNEL_LAST_SET
 
 # Wire size (in bytes) of an `ATTR_LIVE_CHANNEL_STATE` value. The hot-fix
 # changed this from 2 (uint16 LE, per-mille) to 4 (uint32 LE, raw scale).
