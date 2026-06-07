@@ -76,6 +76,23 @@ PR-3e (2026-06-07) — write-path experiment via CHAR_AUX:
   protocol for direct control. Cheaper attribute-probing approaches
   exhausted at that point.
 
+PR-3f (2026-06-07) — revert PR-3e:
+  PR-3e flipped writes from CHAR_TX_DATA to CHAR_AUX. Result: every write
+  timed out, even connect-time ATTR_SERIAL read returned no response.
+  CHAR_AUX is not the FSCI path; the GATT write succeeds but no response
+  comes back on any notify characteristic (CHAR_RX_DATA, CHAR_RX_FINAL,
+  or CHAR_AUX itself). PR-3f reverts _WRITE_CHARACTERISTIC back to
+  CHAR_TX_DATA so the integration returns to the PR-3c/3d state: reads
+  work, writes complete at FSCI level (status=SUCCESS) but the AI Prime
+  silently discards them. PR-3f keeps the CHAR_AUX notify subscription
+  in place — harmless and saves a future test from needing to add it
+  back if a different write payload to CHAR_AUX is ever attempted.
+
+  Next escalation is BLE sniff of myAI traffic (nRF52840 USB dongle
+  ~$10 + nRF Sniffer for Bluetooth LE firmware + Wireshark) to capture
+  ground-truth wire protocol for direct channel control. Attribute and
+  characteristic guessing have been exhausted.
+
 Reconnect topology: one long-running `_connect_with_retry` task per
 "connection epoch". The task loops with exponential backoff until a connect
 succeeds, then exits. The bleak disconnect callback spawns a fresh task
@@ -165,13 +182,16 @@ _UNWRITABLE_CHANNEL_IDS: frozenset[int] = frozenset(
 # captures the device's current state). 50% of full scale.
 _POWER_ON_FALLBACK_DEVICE_VALUE = DEVICE_VALUE_MAX // 2
 
-# PR-3e (2026-06-07): characteristic used for FSCI request writes.
+# PR-3e/3f (2026-06-07): characteristic used for FSCI request writes.
 # CHAR_TX_DATA (01ff0103) was the original target since PR-2; PR-3c and
 # PR-3d both wrote there with status=SUCCESS but no physical effect.
-# CHAR_AUX (01ff0105) is the experimental target — discovered Day 3,
-# `[write-without-response, notify]`, never used until now.
-# Swap this constant back to CHAR_TX_DATA to revert PR-3e if needed.
-_WRITE_CHARACTERISTIC = CHAR_AUX
+# PR-3e flipped to CHAR_AUX (01ff0105) as an experiment — DISPROVEN:
+# every write timed out, even connect-time ATTR_SERIAL read returned
+# nothing. CHAR_AUX is not the FSCI path. PR-3f reverts back to
+# CHAR_TX_DATA so reads + writes at least round-trip again (writes
+# still ACK-and-discard at the device level — same state as PR-3c/3d).
+# Next escalation is BLE sniff of myAI traffic to find the real path.
+_WRITE_CHARACTERISTIC = CHAR_TX_DATA
 
 _FrameBuilder = Callable[[], "tuple[int, bytes]"]
 
@@ -488,12 +508,11 @@ class AIPrimeHub:
     ) -> bytes | None:
         """Single-attempt FSCI round-trip. Caller (`_send_request`) handles retries.
 
-        PR-3e (2026-06-07): writes go to _WRITE_CHARACTERISTIC (currently
-        CHAR_AUX = 01ff0105). Was CHAR_TX_DATA (01ff0103) since PR-2 —
-        switched after PR-3c/3d demonstrated that writes to CHAR_TX_DATA
-        ACK with status=SUCCESS but never physically apply. Revert by
-        flipping _WRITE_CHARACTERISTIC back to CHAR_TX_DATA if AUX also
-        fails or causes regressions.
+        PR-3e/3f (2026-06-07): writes go to _WRITE_CHARACTERISTIC. PR-3e
+        flipped this to CHAR_AUX as an experiment; PR-3f reverted to
+        CHAR_TX_DATA after AUX produced 100% write timeouts (no FSCI
+        response on any notify path). See module docstring for full
+        history.
         """
         client = self._client
         if client is None or not client.is_connected:
