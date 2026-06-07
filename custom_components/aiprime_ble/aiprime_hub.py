@@ -43,6 +43,39 @@ PR-3c (2026-06-06) — first mutating writes:
     are silently skipped at DEBUG level — they return InvalidElement on
     attribute 1504 by design (fan is auto-managed, 0x1E is schedule-only).
 
+PR-3e (2026-06-07) — write-path experiment via CHAR_AUX:
+  PR-3c and PR-3d both deployed real writes — PR-3c to attribute 1504 via
+  CHAR_TX_DATA, PR-3d to attribute 1513 via CHAR_TX_DATA. Both produced
+  status=SUCCESS at the FSCI level (~100ms round-trip, no retries needed)
+  but the AI Prime never physically applied any value. Schedule-conflict
+  hypothesis disproven: user deleted all schedule points via myAI, ran
+  manual-on for 1 min via myAI, swipe-killed myAI, re-tested via HA — no
+  physical change. Both attribute targets are silent-ACK-and-discard.
+
+  PR-3e tests a different hypothesis: maybe writes need to go to CHAR_AUX
+  (01ff0105) instead of CHAR_TX_DATA. CHAR_AUX was discovered Day 3 but
+  never used — per const.py "[write-without-response, notify]. Purpose
+  TBD — candidates: bulk-write streaming, push notifications, OTA fast
+  path." If myAI actually uses CHAR_AUX for direct control while
+  CHAR_TX_DATA is for config queries, this swap should make writes
+  physically apply.
+
+  Changes:
+    - `_send_request_once` now writes to CHAR_AUX (was CHAR_TX_DATA).
+    - `_async_connect` ALSO subscribes to CHAR_AUX notifications in case
+      responses come back there instead of (or in addition to)
+      CHAR_RX_DATA / CHAR_RX_FINAL. AUX subscription failure is
+      tolerated — connection continues with just the existing two
+      subscriptions, and writes-via-AUX may still work if the device
+      sends responses back on CHAR_RX_FINAL.
+    - All AUX notifications route to the same _on_rx_final handler so the
+      msg_id matcher and in-flight future dict pick them up automatically.
+
+  If THIS doesn't work either, the next escalation is a BLE sniff of myAI
+  (~$30-50 nRF52840 dongle + Wireshark) to capture ground-truth wire
+  protocol for direct control. Cheaper attribute-probing approaches
+  exhausted at that point.
+
 Reconnect topology: one long-running `_connect_with_retry` task per
 "connection epoch". The task loops with exponential backoff until a connect
 succeeds, then exits. The bleak disconnect callback spawns a fresh task
@@ -80,6 +113,7 @@ from .const import (
     CHANNEL_DEFAULT_LABELS,
     CHANNEL_ID_FAN,
     CHANNEL_STATE_ITEM_LEN,
+    CHAR_AUX,
     CHAR_RX_DATA,
     CHAR_RX_FINAL,
     CHAR_TX_DATA,
@@ -130,6 +164,14 @@ _UNWRITABLE_CHANNEL_IDS: frozenset[int] = frozenset(
 # a channel (e.g., immediately after HA boot before the first periodic poll
 # captures the device's current state). 50% of full scale.
 _POWER_ON_FALLBACK_DEVICE_VALUE = DEVICE_VALUE_MAX // 2
+
+# PR-3e (2026-06-07): characteristic used for FSCI request writes.
+# CHAR_TX_DATA (01ff0103) was the original target since PR-2; PR-3c and
+# PR-3d both wrote there with status=SUCCESS but no physical effect.
+# CHAR_AUX (01ff0105) is the experimental target — discovered Day 3,
+# `[write-without-response, notify]`, never used until now.
+# Swap this constant back to CHAR_TX_DATA to revert PR-3e if needed.
+_WRITE_CHARACTERISTIC = CHAR_AUX
 
 _FrameBuilder = Callable[[], "tuple[int, bytes]"]
 
@@ -288,6 +330,23 @@ class AIPrimeHub:
                 await self._async_disconnect()
                 return
 
+            # PR-3e (2026-06-07): also subscribe to CHAR_AUX notify in case
+            # writes-via-AUX get responses back on AUX instead of (or in
+            # addition to) CHAR_RX_DATA/CHAR_RX_FINAL. AUX subscription is
+            # best-effort — if it fails, log and continue. Writes may still
+            # succeed via the existing two RX subscriptions.
+            try:
+                await client.start_notify(CHAR_AUX, self._on_rx_final)
+                _LOGGER.debug(
+                    "AIPrimeHub %s: CHAR_AUX notify subscribed (PR-3e)",
+                    self.address,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "AIPrimeHub %s: CHAR_AUX notify subscribe failed "
+                    "(continuing without it): %s", self.address, err,
+                )
+
             self.state.ble_connected = True
             self._reconnect_backoff = DEFAULT_RECONNECT_BACKOFF_INITIAL_S
 
@@ -427,7 +486,15 @@ class AIPrimeHub:
     async def _send_request_once(
         self, msg_id: int, frame: bytes, timeout: float
     ) -> bytes | None:
-        """Single-attempt FSCI round-trip. Caller (`_send_request`) handles retries."""
+        """Single-attempt FSCI round-trip. Caller (`_send_request`) handles retries.
+
+        PR-3e (2026-06-07): writes go to _WRITE_CHARACTERISTIC (currently
+        CHAR_AUX = 01ff0105). Was CHAR_TX_DATA (01ff0103) since PR-2 —
+        switched after PR-3c/3d demonstrated that writes to CHAR_TX_DATA
+        ACK with status=SUCCESS but never physically apply. Revert by
+        flipping _WRITE_CHARACTERISTIC back to CHAR_TX_DATA if AUX also
+        fails or causes regressions.
+        """
         client = self._client
         if client is None or not client.is_connected:
             _LOGGER.debug(
@@ -439,7 +506,7 @@ class AIPrimeHub:
         future: asyncio.Future[bytes] = self.hass.loop.create_future()
         self._in_flight[msg_id] = future
         try:
-            await client.write_gatt_char(CHAR_TX_DATA, frame, response=False)
+            await client.write_gatt_char(_WRITE_CHARACTERISTIC, frame, response=False)
             return await asyncio.wait_for(future, timeout)
         except asyncio.TimeoutError:
             _LOGGER.debug(
