@@ -79,7 +79,7 @@ CHANNEL_DEFAULT_LABELS: dict[int, str] = {
 # Calibration may need a small tweak (e.g., 20000 might really be 19999 or
 # the device may clip slightly above 20000); revisit if write feedback
 # shows asymmetry between set and read values.
-DEVICE_VALUE_MAX = 20000  # raw device units — full scale
+DEVICE_VALUE_MAX = 20000  # raw device units — full scale (READ path, attr 1504)
 USER_VALUE_MAX = 100      # percent — what HA Number entities expose
 
 
@@ -124,55 +124,68 @@ ATTR_CHANNEL_LIST = 901
 #     - Returned non-zero values for 0x10/0x11/0x13/0x16/0x19 matching
 #       what the schedule was driving (~19920 = 99.6%, etc.).
 #     - Returned InvalidElement (status 0x03) for 0x01 (fan) and 0x1E.
-#       Fan makes sense (auto temp control). 0x1E being unsettable is the
-#       strongest hint yet that 0x1E IS Moonlight — Moonlight is schedule-
-#       only on AI Prime, not a directly-targetable channel. Dashboard
-#       label-mapping fix-up will likely swap 0x16 ↔ 0x1E for Moonlight vs
-#       (one of the white channels).
-#     - PR-3c (2026-06-07) update: WRITES to 1504 return status=SUCCESS
-#       round-tripping cleanly through the C6 proxy, but the device never
-#       physically applies the value. Confirms hypothesis that 1504 is a
-#       READ-ONLY view of the schedule's current driving value. The real
-#       write target is 1513 (see PR-3d below).
+#     - PR-3c/3d (2026-06-07): WRITES to 1504 AND 1513 return status=SUCCESS
+#       but the device never physically applies them. These are READ-ONLY
+#       live-state views. The real control-write path is attribute 407
+#       (ATTR_LIVE_CHANNEL_CONTROL below), decoded from myAI 2026-06-10.
 #
 #   1513 (ATTR_LIVE_CHANNEL_LAST_SET):
-#     - 4-byte payload, returned identical values to 1504 across all
-#       channels at probe time. Originally hypothesized as an alias /
-#       mirror "until someone writes" — PR-3d (2026-06-07) tests that
-#       hypothesis by routing all writes here.
+#     - 4-byte payload, mirror of 1504 on read; also ACK-discards writes.
 #
 ATTR_CHANNEL_STATUS_WORD = 1500   # 2-byte status flag; always 0 in current observations
-ATTR_LIVE_CHANNEL_STATE = 1504    # 4-byte uint32 LE; READ target for live state (read-only in practice)
-ATTR_LIVE_CHANNEL_LAST_SET = 1513 # 4-byte uint32 LE; WRITE target as of PR-3d
+ATTR_LIVE_CHANNEL_STATE = 1504    # 4-byte uint32 LE; READ target for live state
+ATTR_LIVE_CHANNEL_LAST_SET = 1513 # 4-byte uint32 LE; read mirror of 1504
 ATTR_SCENES = 400
 ATTR_SCHEDULE = 500
 
-# Write target alias used by protocol/fsci.py's build_set_channel (and
-# the currently-unused build_get_channel_targets).
-#
-# PR-3d (2026-06-07): retargeted from ATTR_LIVE_CHANNEL_STATE (1504) ->
-# ATTR_LIVE_CHANNEL_LAST_SET (1513). Background: PR-3c writes to 1504
-# completed at the FSCI level (status=SUCCESS, ~100ms per channel via
-# C6 proxy) but the AI Prime never physically applied any value. The
-# probe noted 1513 "returned identical values to 1504 ... likely an
-# alias / mirror until someone writes" — PR-3d is the first write here.
-#
-# Reads continue via ATTR_LIVE_CHANNEL_STATE (1504) explicitly in
-# _async_read_channel_state — no read-path change. The unused
-# build_get_channel_targets helper now reads from 1513 instead of 1504,
-# but probe confirmed the two return identical values on read so this
-# is incidentally fine.
-#
-# If 1513 ALSO doesn't make writes physically apply, the next hypothesis
-# is schedule conflict (schedule overwrites the write on its next tick).
-# That would require Mobius to temporarily disable the schedule for
-# diagnostic, and ultimately Day 6+ HA-side schedule control as a
-# prerequisite to writes being useful in any realistic deployment.
-ATTR_LIVE_CHANNEL_TARGET = ATTR_LIVE_CHANNEL_LAST_SET
+# Legacy per-channel write alias (used only by the now-deprecated
+# build_set_channel / build_get_channel_targets). Kept so those builders
+# still import cleanly. The hub no longer writes per-channel — see
+# ATTR_LIVE_CHANNEL_CONTROL below (PR-4).
+ATTR_LIVE_CHANNEL_TARGET = ATTR_LIVE_CHANNEL_STATE
 
 # Wire size (in bytes) of an `ATTR_LIVE_CHANNEL_STATE` value. The hot-fix
 # changed this from 2 (uint16 LE, per-mille) to 4 (uint32 LE, raw scale).
 CHANNEL_STATE_ITEM_LEN = 4
+
+# === PR-4 (2026-06-10): DECODED myAI live-control write path ===============
+# Captured from the myAI iOS app via PacketLogger HCI log and verified
+# byte-for-byte (CRC included) against our codec. myAI controls the light
+# with a SINGLE FSCI SET to attribute 407 carrying ALL 7 channels at once,
+# via CHAR_TX_DATA. Full spec in memory [[aiprime-write-protocol-decoded]].
+ATTR_LIVE_CHANNEL_CONTROL = 407   # 0x0197 — bulk all-channel control WRITE
+
+# Exact channel order myAI places inside the attr-407 frame. Replicated.
+CHANNEL_WRITE_ORDER: tuple[int, ...] = (0x11, 0x13, 0x19, 0x1E, 0x16, 0x10, 0x01)
+
+# Fade/ramp byte in the attr-407 header. myAI used 0x0a (10) for slider
+# drags and 0x3c (60) for on/off toggles — treat as a fade duration hint.
+RAMP_SLIDER = 0x0A
+RAMP_POWER = 0x3C
+
+# Channel value scale on the attr-407 WRITE path is 0..1000 (per-mille),
+# DIFFERENT from the 0..20000 read scale on attr 1504. Convert between them.
+DEVICE_WRITE_VALUE_MAX = 1000
+
+
+def device_read_to_write(value_device: int) -> int:
+    """Convert a 0..DEVICE_VALUE_MAX read value (attr 1504) to 0..1000 write
+    units (attr 407)."""
+    if value_device <= 0:
+        return 0
+    if value_device >= DEVICE_VALUE_MAX:
+        return DEVICE_WRITE_VALUE_MAX
+    return round(value_device * DEVICE_WRITE_VALUE_MAX / DEVICE_VALUE_MAX)
+
+
+def percent_to_write(pct: float) -> int:
+    """Convert 0..100 percent directly to 0..1000 attr-407 write units."""
+    if pct <= 0:
+        return 0
+    if pct >= USER_VALUE_MAX:
+        return DEVICE_WRITE_VALUE_MAX
+    return round(pct * DEVICE_WRITE_VALUE_MAX / USER_VALUE_MAX)
+
 
 # --- Dispatcher signals ---------------------------------------------------
 SIGNAL_STATE_UPDATED = "aiprime_ble_state_updated_{entry}"

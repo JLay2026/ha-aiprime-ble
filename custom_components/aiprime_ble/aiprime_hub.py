@@ -18,69 +18,29 @@ now reads CHANNEL_STATE_ITEM_LEN (=4) bytes as uint32 LE at attribute 1504
 (was 2 bytes at 1500 — that's a status word, not brightness).
 
 Retry-with-backoff (2026-06-02, PR-3c precursor) — `_send_request` is now a
-retry wrapper around a single-attempt `_send_request_once`. Background:
-the ESP32-S3 BT proxy's Bluedroid stack drops payload-bearing notification
-fragments from AI Prime's Qualcomm QCA4020 controller at a ~70% rate even
-after PSRAM enablement (see [[aiprime-bt-proxy-acl-fragmentation]] memory).
-A single FSCI round-trip therefore has ~28% success against this device.
-With 3 attempts at 5s/3s/3s timeouts and 0.5s/1.0s backoffs:
-  - Per-call success: 1 - 0.72^3 ≈ 63%
-  - Per-channel success across 2 poll cycles: 1 - 0.37^2 ≈ 86%
-  - Per-channel success across 3 cycles: 94%
-Each attempt uses a FRESH msg_id (builder is invoked per attempt) so a
-late response to a timed-out attempt doesn't shadow a fresh request.
+retry wrapper around a single-attempt `_send_request_once`.
 
-PR-3c (2026-06-06) — first mutating writes:
-  - `async_set_channel` builds a real FSCI SET via codec.build_set_channel,
-    sends through _send_request retry wrapper, applies optimistic state
-    update with rollback on failure.
-  - `async_set_power` walks LED channels (skipping fan + known-unwritable
-    0x1E) and calls async_set_channel for each. "On" restores the last-
-    known nonzero value per channel, falling back to 50% if unknown.
-  - Periodic poll opportunistically populates _last_nonzero_values so
-    HA-initiated on/off restores values set by Mobius / schedule too.
-  - Known-unwritable channels (CHANNEL_ID_FAN, CHANNEL_ID_LIKELY_MOONLIGHT)
-    are silently skipped at DEBUG level — they return InvalidElement on
-    attribute 1504 by design (fan is auto-managed, 0x1E is schedule-only).
+PR-3c..3f (2026-06-06/07) — per-channel write attempts to attributes 1504
+and 1513, and a CHAR_AUX experiment. ALL produced status=SUCCESS (or, for
+AUX, timeouts) but never physically drove the light. Root cause found via
+an iOS PacketLogger capture of the myAI app (2026-06-10): 1504/1513 are
+read-only live-state views; the real control-write path is attribute 407
+as an ALL-CHANNEL bulk SET. See [[aiprime-write-protocol-decoded]].
 
-PR-3e (2026-06-07) — write-path experiment via CHAR_AUX:
-  PR-3c and PR-3d both deployed real writes — PR-3c to attribute 1504 via
-  CHAR_TX_DATA, PR-3d to attribute 1513 via CHAR_TX_DATA. Both produced
-  status=SUCCESS at the FSCI level (~100ms round-trip, no retries needed)
-  but the AI Prime never physically applied any value. Schedule-conflict
-  hypothesis disproven: user deleted all schedule points via myAI, ran
-  manual-on for 1 min via myAI, swipe-killed myAI, re-tested via HA — no
-  physical change. Both attribute targets are silent-ACK-and-discard.
-
-  PR-3e tests a different hypothesis: maybe writes need to go to CHAR_AUX
-  (01ff0105) instead of CHAR_TX_DATA. CHAR_AUX was discovered Day 3 but
-  never used — per const.py "[write-without-response, notify]. Purpose
-  TBD — candidates: bulk-write streaming, push notifications, OTA fast
-  path." If myAI actually uses CHAR_AUX for direct control while
-  CHAR_TX_DATA is for config queries, this swap should make writes
-  physically apply.
-
-  Changes:
-    - `_send_request_once` now writes to CHAR_AUX (was CHAR_TX_DATA).
-    - `_async_connect` ALSO subscribes to CHAR_AUX notifications in case
-      responses come back there instead of (or in addition to)
-      CHAR_RX_DATA / CHAR_RX_FINAL. AUX subscription failure is
-      tolerated — connection continues with just the existing two
-      subscriptions, and writes-via-AUX may still work if the device
-      sends responses back on CHAR_RX_FINAL.
-    - All AUX notifications route to the same _on_rx_final handler so the
-      msg_id matcher and in-flight future dict pick them up automatically.
-
-  If THIS doesn't work either, the next escalation is a BLE sniff of myAI
-  (~$30-50 nRF52840 dongle + Wireshark) to capture ground-truth wire
-  protocol for direct control. Cheaper attribute-probing approaches
-  exhausted at that point.
+PR-4 (2026-06-10) — implement the decoded control path:
+  - Writes go to CHAR_TX_DATA (confirmed correct by capture; reverts the
+    PR-3e CHAR_AUX experiment).
+  - self._desired holds a write-scale (0..1000) value per channel. Every
+    HA control action updates the relevant channel(s) then sends ONE
+    codec.build_set_all_channels frame (attr 407) carrying all 7 channels,
+    exactly as myAI does.
+  - async_set_channel / async_set_power both funnel through
+    _write_all_channels(ramp) with optimistic UI + revert on failure.
 
 Reconnect topology: one long-running `_connect_with_retry` task per
-"connection epoch". The task loops with exponential backoff until a connect
-succeeds, then exits. The bleak disconnect callback spawns a fresh task
-when the link drops — there is at most one connect task in flight at any
-time, guarded by `_connect_task` and the per-attempt `_connect_lock`.
+"connection epoch". The bleak disconnect callback spawns a fresh task when
+the link drops — at most one connect task in flight, guarded by
+`_connect_task` and the per-attempt `_connect_lock`.
 """
 
 from __future__ import annotations
@@ -113,6 +73,7 @@ from .const import (
     CHANNEL_DEFAULT_LABELS,
     CHANNEL_ID_FAN,
     CHANNEL_STATE_ITEM_LEN,
+    CHANNEL_WRITE_ORDER,
     CHAR_AUX,
     CHAR_RX_DATA,
     CHAR_RX_FINAL,
@@ -123,9 +84,13 @@ from .const import (
     DEFAULT_RECONNECT_BACKOFF_INITIAL_S,
     DEFAULT_STATE_POLL_INTERVAL_S,
     DEVICE_VALUE_MAX,
+    DEVICE_WRITE_VALUE_MAX,
     DOMAIN,
+    RAMP_POWER,
+    RAMP_SLIDER,
     SIGNAL_AVAILABILITY,
     SIGNAL_STATE_UPDATED,
+    device_read_to_write,
 )
 from .protocol import (
     FsciCodec,
@@ -146,32 +111,16 @@ _RETRY_BACKOFFS_S: tuple[float, ...] = (0.5, 1.0)
 _DEFAULT_RETRIES = 2
 _QUIET_CONNECT_ATTEMPTS = 5
 
-# PR-3c (2026-06-06): channels that are NOT user-writable per the 2026-06-02
-# channel-state probe (see const.py "Channel state attributes" comment).
-# Writes to these channels return InvalidElement on attribute 1504 by design:
-#   - 0x01 (fan): auto-managed by AI Prime's internal temperature control
-#   - 0x1E: empirically returns InvalidElement on writes; likely Moonlight,
-#     which is schedule-only on the AI Prime platform (not directly settable).
-# We silently skip writes to these channels rather than emit error noise.
-# When channel labeling is empirically corrected (future PR), reconsider
-# whether 0x1E should be filtered out at the entity-builder layer instead.
-_CHANNEL_ID_LIKELY_MOONLIGHT = 0x1E
-_UNWRITABLE_CHANNEL_IDS: frozenset[int] = frozenset(
-    {CHANNEL_ID_FAN, _CHANNEL_ID_LIKELY_MOONLIGHT}
-)
+# PR-4 (2026-06-10): writes go to attribute 407 as an all-channel bulk SET
+# (decoded from the myAI app via iOS HCI capture). The old per-channel
+# "unwritable" exclusion (fan 0x01 / moonlight 0x1E) is gone — the bulk
+# frame includes all 7 channels exactly as myAI sends them. See
+# [[aiprime-write-protocol-decoded]].
 
-# Fallback brightness for "Master ON" when we have no last-known value for
-# a channel (e.g., immediately after HA boot before the first periodic poll
-# captures the device's current state). 50% of full scale.
-_POWER_ON_FALLBACK_DEVICE_VALUE = DEVICE_VALUE_MAX // 2
-
-# PR-3e (2026-06-07): characteristic used for FSCI request writes.
-# CHAR_TX_DATA (01ff0103) was the original target since PR-2; PR-3c and
-# PR-3d both wrote there with status=SUCCESS but no physical effect.
-# CHAR_AUX (01ff0105) is the experimental target — discovered Day 3,
-# `[write-without-response, notify]`, never used until now.
-# Swap this constant back to CHAR_TX_DATA to revert PR-3e if needed.
-_WRITE_CHARACTERISTIC = CHAR_AUX
+# Characteristic used for FSCI request writes. CHAR_TX_DATA (01ff0103) is the
+# correct target, confirmed by the myAI iOS capture (writes land on GATT
+# handle 0x002b = CHAR_TX_DATA). PR-3e's CHAR_AUX experiment is reverted here.
+_WRITE_CHARACTERISTIC = CHAR_TX_DATA
 
 _FrameBuilder = Callable[[], "tuple[int, bytes]"]
 
@@ -204,6 +153,13 @@ class AIPrimeHub:
         # restore. Populated by writes AND by periodic polls (so values set
         # via Mobius / device schedule are also remembered).
         self._last_nonzero_values: dict[int, int] = {}
+
+        # PR-4: desired write-state per channel in WRITE scale (0..1000).
+        # myAI controls the light by writing ALL channels at once to attr 407;
+        # we mirror that. Seeded to 0 for every channel, updated from reads
+        # (readable channels) and from HA-initiated writes. See memory
+        # [[aiprime-write-protocol-decoded]].
+        self._desired: dict[int, int] = {cid: 0 for cid in ALL_CHANNEL_IDS}
 
     async def async_setup(self) -> None:
         if not self.address:
@@ -330,15 +286,12 @@ class AIPrimeHub:
                 await self._async_disconnect()
                 return
 
-            # PR-3e (2026-06-07): also subscribe to CHAR_AUX notify in case
-            # writes-via-AUX get responses back on AUX instead of (or in
-            # addition to) CHAR_RX_DATA/CHAR_RX_FINAL. AUX subscription is
-            # best-effort — if it fails, log and continue. Writes may still
-            # succeed via the existing two RX subscriptions.
+            # PR-3e (2026-06-07): also subscribe to CHAR_AUX notify (harmless;
+            # kept across PR-4 in case a future probe needs it). Best-effort.
             try:
                 await client.start_notify(CHAR_AUX, self._on_rx_final)
                 _LOGGER.debug(
-                    "AIPrimeHub %s: CHAR_AUX notify subscribed (PR-3e)",
+                    "AIPrimeHub %s: CHAR_AUX notify subscribed",
                     self.address,
                 )
             except Exception as err:  # noqa: BLE001
@@ -437,19 +390,13 @@ class AIPrimeHub:
     ) -> bytes | None:
         """Send an FSCI request with retry-with-backoff on timeout.
 
-        BT proxy ACL fragmentation drops ~70% of payload-bearing
-        notifications even after PSRAM enablement (see
-        [[aiprime-bt-proxy-acl-fragmentation]]). Three attempts with
-        0.5s/1.0s backoffs turn ~30% per-attempt success into ~63%
-        per-call success, compounding to ~94% across 3 poll cycles.
+        BT proxy ACL fragmentation drops payload-bearing notifications even
+        after PSRAM enablement (see [[aiprime-bt-proxy-acl-fragmentation]]).
+        Three attempts with 0.5s/1.0s backoffs compound per-attempt success.
 
         Each attempt invokes `builder()` fresh so a late response to a
         timed-out attempt is discarded (logged as unmatched RX) rather
         than shadowing the new request.
-
-        Stops retrying immediately on BLE disconnect — the reconnect
-        loop will restart the connection epoch and a future poll cycle
-        will re-attempt.
         """
         last_msg_id = -1
         for attempt in range(retries + 1):
@@ -488,12 +435,8 @@ class AIPrimeHub:
     ) -> bytes | None:
         """Single-attempt FSCI round-trip. Caller (`_send_request`) handles retries.
 
-        PR-3e (2026-06-07): writes go to _WRITE_CHARACTERISTIC (currently
-        CHAR_AUX = 01ff0105). Was CHAR_TX_DATA (01ff0103) since PR-2 —
-        switched after PR-3c/3d demonstrated that writes to CHAR_TX_DATA
-        ACK with status=SUCCESS but never physically apply. Revert by
-        flipping _WRITE_CHARACTERISTIC back to CHAR_TX_DATA if AUX also
-        fails or causes regressions.
+        Writes go to _WRITE_CHARACTERISTIC (CHAR_TX_DATA, confirmed correct
+        by the myAI iOS capture 2026-06-10).
         """
         client = self._client
         if client is None or not client.is_connected:
@@ -683,19 +626,13 @@ class AIPrimeHub:
     async def _async_read_channel_state(self) -> None:
         """Per-channel GET ATTR_LIVE_CHANNEL_STATE; updates state.channels values.
 
-        Each per-channel request now goes through `_send_request`'s retry
-        wrapper (3 attempts, 5s/3s/3s timeouts, 0.5s/1.0s backoffs). With
-        ~30% per-attempt success against the BT-proxy-induced fragmentation
-        loss, expect ~63% per-call success and ~94% across 3 poll cycles.
+        Channels 0x01 (fan) and 0x1E return InvalidElement on attribute 1504
+        — both are system-managed and don't read back; that's intentional.
 
-        Channels 0x01 (fan) and 0x1E (likely Moonlight) return InvalidElement
-        on attribute 1504 — both are system-managed, not user-targetable.
-        Their state simply doesn't update from this poll; that's intentional.
-
-        PR-3c: when a nonzero value is read, opportunistically populate
-        _last_nonzero_values so a subsequent HA-initiated "Master ON" can
-        restore the channel to its actual prior brightness (including values
-        set by Mobius / device schedules, not just HA writes).
+        PR-3c: nonzero reads populate _last_nonzero_values for Master-ON
+        restore. PR-4: reads also seed the write-scale _desired mirror for
+        the readable channels (0x01 / 0x1E stay at their last HA-written
+        value since they never read back).
         """
         if not self.state.channels:
             _LOGGER.debug(
@@ -736,6 +673,9 @@ class AIPrimeHub:
             value = max(0, min(DEVICE_VALUE_MAX, value))
             if value > 0:
                 self._last_nonzero_values[channel_id] = value
+            # PR-4: keep the write-scale desired mirror in sync with reality
+            # for the channels we can actually read.
+            self._desired[channel_id] = device_read_to_write(value)
             cs = self.state.channels.get(channel_id)
             if cs is not None and cs.value_device != value:
                 cs.value_device = value
@@ -770,25 +710,55 @@ class AIPrimeHub:
             self.state.rssi = service_info.rssi
             self._notify_state_changed()
 
+    async def _write_all_channels(self, ramp: int) -> bool:
+        """Write the full desired channel set via attribute 407 (PR-4).
+
+        This is the actual myAI control path (decoded 2026-06-10). One FSCI
+        SET to attr 407 carries all 7 channels at once. Returns True on a
+        Success CONFIRM, False otherwise (caller may revert optimistic UI).
+        """
+        reply = await self._send_request(
+            lambda: self._codec.build_set_all_channels(dict(self._desired), ramp)
+        )
+        if reply is None:
+            _LOGGER.warning(
+                "AIPrimeHub %s: attr-407 channel write exhausted retries",
+                self.address,
+            )
+            return False
+        status = parse_response_status(reply)
+        if status != STATUS_SUCCESS:
+            _LOGGER.warning(
+                "AIPrimeHub %s: attr-407 channel write CONFIRM status=%s",
+                self.address,
+                status_name(status) if status >= 0 else "MalformedFrame",
+            )
+            return False
+        _LOGGER.debug(
+            "AIPrimeHub %s: attr-407 channel write OK (ramp=0x%02x) desired=%s",
+            self.address, ramp,
+            {f"0x{c:02x}": v for c, v in self._desired.items()},
+        )
+        return True
+
     async def async_set_channel(self, channel_id: int, value_device: int) -> None:
-        """Write one channel's target brightness via FSCI SET.
+        """Set one channel; writes the FULL channel set via attr 407 (PR-4).
 
-        PR-3c (2026-06-06): replaces the v0.0.1 stub. Strategy:
-          1. Validate (channel known, channel writable) — early returns for
-             skip cases.
-          2. Optimistic local-state update + notify so HA UI reacts instantly.
-          3. Send the FSCI SET via `_send_request` (retry wrapper).
-          4. On any failure (retry-exhausted / status != Success), revert the
-             local-state and notify again, leaving the slider showing reality.
-          5. On success, opportunistically remember the value for Master-ON
-             restore.
+        The device only accepts an all-channels bulk write to attribute 407
+        (decoded from myAI 2026-06-10). So a single-channel HA action updates
+        that channel's desired value, then re-sends every channel. Other
+        channels are held at their current desired values.
 
-        Caveat: rapid back-to-back writes on the same channel can race —
-        if write A and write B are both in flight, A's failure-revert can
-        revert B's optimistic state. Not a problem for typical slider use
-        (HA serializes per-entity service calls); revisit if it bites in
-        practice. See task notes for the deterministic fix (re-poll instead
-        of revert).
+        value_device is in the READ scale (0..DEVICE_VALUE_MAX, 0..20000) as
+        produced by number.py's percent_to_device(); we convert to the
+        write scale (0..1000) internally.
+
+        CAVEAT: channels 0x01 (fan) and 0x1E never read back (InvalidElement),
+        so their desired value is whatever HA last wrote (default 0). A bulk
+        write therefore sends 0 for them unless the user has set them via
+        their own entity. If moonlight (0x1E) was driven by the device
+        schedule, an HA channel change can switch it off. Follow-up: seed the
+        full state by reading attr 407 at connect. See task notes.
         """
         if channel_id not in self.state.channels:
             _LOGGER.warning(
@@ -796,87 +766,60 @@ class AIPrimeHub:
                 self.address, channel_id,
             )
             return
-        if channel_id in _UNWRITABLE_CHANNEL_IDS:
-            _LOGGER.debug(
-                "AIPrimeHub %s: skipping write to unwritable channel 0x%02X "
-                "(returns InvalidElement by design — fan / schedule-only)",
-                self.address, channel_id,
-            )
-            return
 
-        clamped = max(0, min(DEVICE_VALUE_MAX, int(value_device)))
-        prev_value = self.state.channels[channel_id].value_device
+        clamped_read = max(0, min(DEVICE_VALUE_MAX, int(value_device)))
+        prev_read = self.state.channels[channel_id].value_device
+        prev_desired = self._desired.get(channel_id, 0)
 
-        # Optimistic update — HA UI sees the new value immediately.
-        self.state.channels[channel_id].value_device = clamped
+        # Optimistic local update (read-scale for the entity, write-scale mirror)
+        self.state.channels[channel_id].value_device = clamped_read
+        self._desired[channel_id] = device_read_to_write(clamped_read)
         self._notify_state_changed()
 
-        reply = await self._send_request(
-            lambda: self._codec.build_set_channel(channel_id, clamped)
-        )
-        if reply is None:
-            _LOGGER.warning(
-                "AIPrimeHub %s: set channel 0x%02X to %d exhausted retries; "
-                "reverting local state to %d",
-                self.address, channel_id, clamped, prev_value,
-            )
-            self.state.channels[channel_id].value_device = prev_value
+        ok = await self._write_all_channels(RAMP_SLIDER)
+        if not ok:
+            # revert both mirrors
+            self.state.channels[channel_id].value_device = prev_read
+            self._desired[channel_id] = prev_desired
             self._notify_state_changed()
             return
 
-        status = parse_response_status(reply)
-        if status != STATUS_SUCCESS:
-            _LOGGER.warning(
-                "AIPrimeHub %s: set channel 0x%02X to %d CONFIRM status=%s; "
-                "reverting local state to %d",
-                self.address, channel_id, clamped,
-                status_name(status) if status >= 0 else "MalformedFrame",
-                prev_value,
-            )
-            self.state.channels[channel_id].value_device = prev_value
-            self._notify_state_changed()
-            return
-
-        # Success — remember the value for Master-ON restore.
-        if clamped > 0:
-            self._last_nonzero_values[channel_id] = clamped
-        _LOGGER.debug(
-            "AIPrimeHub %s: set channel 0x%02X to %d OK",
-            self.address, channel_id, clamped,
-        )
+        if clamped_read > 0:
+            self._last_nonzero_values[channel_id] = clamped_read
 
     async def async_set_power(self, *, on: bool) -> None:
-        """Turn the fixture on/off by writing each writable LED channel.
+        """Turn the fixture on/off via a single attr-407 bulk write (PR-4).
 
-        PR-3c (2026-06-06): replaces the v0.0.1 stub. Writes are issued
-        sequentially via `async_set_channel` (which handles retries and
-        rollback per-channel). Fan and known-unwritable channels are
-        skipped by `async_set_channel` itself.
-
-        "On" semantics:
-          - Use the last-known nonzero value for each channel (captured
-            either from a prior HA write or from a periodic state poll
-            that observed Mobius / schedule-set brightness).
-          - Fall back to 50% of full scale if we've never seen the channel
-            nonzero (e.g., HA boot before the first successful poll).
-
-        "Off" semantics:
-          - Write 0 to every writable LED channel.
+        Off: set every LED channel desired to 0. On: restore each LED
+        channel's last-known nonzero value (read scale), falling back to
+        full scale if never seen. Fan (0x01) is left at its current desired
+        value (auto-managed; HA doesn't drive it). One bulk write applies
+        all of it with the power ramp.
         """
-        for channel_id in list(self.state.channels):
-            if channel_id in _UNWRITABLE_CHANNEL_IDS:
+        prev_desired = dict(self._desired)
+        prev_reads = {c: cs.value_device for c, cs in self.state.channels.items()}
+
+        for channel_id in self.state.channels:
+            if channel_id == CHANNEL_ID_FAN:
                 continue
             if on:
-                target = self._last_nonzero_values.get(
-                    channel_id, _POWER_ON_FALLBACK_DEVICE_VALUE
-                )
+                read_val = self._last_nonzero_values.get(channel_id, DEVICE_VALUE_MAX)
             else:
-                target = 0
-            await self.async_set_channel(channel_id, target)
+                read_val = 0
+            self.state.channels[channel_id].value_device = read_val
+            self._desired[channel_id] = device_read_to_write(read_val)
+        self._notify_state_changed()
 
-        _LOGGER.debug(
-            "AIPrimeHub %s: set power=%s complete", self.address, on
-        )
+        ok = await self._write_all_channels(RAMP_POWER)
+        if not ok:
+            self._desired = prev_desired
+            for c, v in prev_reads.items():
+                if c in self.state.channels:
+                    self.state.channels[c].value_device = v
+            self._notify_state_changed()
+            return
+
+        _LOGGER.debug("AIPrimeHub %s: set power=%s complete", self.address, on)
 
     def is_on(self) -> bool:
         return any(

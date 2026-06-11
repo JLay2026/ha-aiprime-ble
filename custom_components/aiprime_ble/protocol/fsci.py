@@ -39,11 +39,15 @@ import struct
 from typing import Optional
 
 from ..const import (
+    ATTR_LIVE_CHANNEL_CONTROL,
     ATTR_LIVE_CHANNEL_STATE,
     ATTR_LIVE_CHANNEL_TARGET,
     ATTR_MESH_LOCAL_ADDRESSES,
     CHANNEL_STATE_ITEM_LEN,
+    CHANNEL_WRITE_ORDER,
     DEVICE_VALUE_MAX,
+    DEVICE_WRITE_VALUE_MAX,
+    RAMP_SLIDER,
 )
 
 __all__ = [
@@ -288,12 +292,14 @@ class FsciCodec:
             hot-fixed scale. Was 1000, which would have silently capped
             every write at ~5%.
 
+        DEPRECATED by PR-4 (2026-06-10): the device does NOT apply writes to
+        attribute 1504/1513 — those are read-only live-state views. The real
+        control path is build_set_all_channels (attribute 407). This builder
+        is retained only for reference / potential probing; the hub no longer
+        calls it.
+
         Uses `instance = channel_id` (the FSCI convention for "which
-        sub-thing of this attribute"). Empirically validated via the
-        2026-06-02 channel probe — same attribute (1504) handles both
-        reads and writes; instance = channel_id is correct for reads,
-        so by symmetry it's correct here. Verified end-to-end as part
-        of PR-3c install/smoke test.
+        sub-thing of this attribute").
         """
         clamped = max(0, min(DEVICE_VALUE_MAX, int(value_device)))
         value_bytes = struct.pack("<I", clamped)
@@ -304,6 +310,45 @@ class FsciCodec:
             1,                                # count
             CHANNEL_STATE_ITEM_LEN,           # itemLen = 4
         ) + value_bytes
+        return self._build_frame(_OP_CODE_SET, payload)
+
+
+    def build_set_all_channels(
+        self,
+        values: dict[int, int],
+        ramp: int = RAMP_SLIDER,
+    ) -> tuple[int, bytes]:
+        """SET all channels at once via attribute 407 — the myAI control path.
+
+        DECODED 2026-06-10 from an iOS HCI (PacketLogger) capture of the myAI
+        app. The device's live-control write target is attribute 407 (0x0197),
+        written as a single bulk frame carrying ALL channels — NOT the
+        per-channel writes to 1504/1513 attempted in PR-3c/3d (those are
+        read-only live-state views that silently ACK-discard writes). See
+        memory note [[aiprime-write-protocol-decoded]].
+
+        `values` maps channel_id -> 0..DEVICE_WRITE_VALUE_MAX (per-mille,
+        0..1000). Missing channels default to 0. `ramp` is the fade byte
+        (RAMP_SLIDER 0x0a for slider-style, RAMP_POWER 0x3c for on/off).
+
+        45-byte value layout (verified byte-identical to myAI, CRC included):
+            [0]      0x01            const
+            [1:4]    00 00 00        const
+            [4]      0x01            const
+            [5]      0x00            const
+            [6]      ramp            fade byte
+            [7:24]   17x 0x00        zero pad
+            [24:45]  7x [id:1][value:uint16 LE]  in CHANNEL_WRITE_ORDER
+        """
+        header = bytes([0x01, 0x00, 0x00, 0x00, 0x01, 0x00, ramp & 0xFF]) + bytes(17)
+        chan_bytes = bytearray()
+        for cid in CHANNEL_WRITE_ORDER:
+            v = max(0, min(DEVICE_WRITE_VALUE_MAX, int(values.get(cid, 0))))
+            chan_bytes += bytes([cid]) + struct.pack("<H", v)
+        value = header + bytes(chan_bytes)
+        payload = struct.pack(
+            "<HBBB", ATTR_LIVE_CHANNEL_CONTROL, 0, 1, len(value)
+        ) + value
         return self._build_frame(_OP_CODE_SET, payload)
 
     # --- Internals -----------------------------------------------------
