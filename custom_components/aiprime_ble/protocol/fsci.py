@@ -232,6 +232,23 @@ class FsciCodec:
         payload = struct.pack("<HBB", attr_id, instance, count)
         return self._build_frame(_OP_CODE_GET, payload)
 
+    def build_get_multi(
+        self,
+        items: "tuple[tuple[int, int, int], ...]",
+    ) -> tuple[int, bytes]:
+        """Build ONE GET frame reading multiple attributes at once.
+
+        `items` is an iterable of (attr_id, instance, count) tuples. Mirrors
+        myAI's batched connect reads (capture msgids 3/6/7). Used to "prime"
+        the device before control writes — the response is parsed best-effort
+        (callers usually ignore it). See const.MYAI_PRIME_READ_GROUPS.
+        """
+        payload = b"".join(
+            struct.pack("<HBB", attr_id, instance, count)
+            for attr_id, instance, count in items
+        )
+        return self._build_frame(_OP_CODE_GET, payload)
+
     def build_set_attribute(
         self,
         attr_id: int,
@@ -284,14 +301,6 @@ class FsciCodec:
     ) -> tuple[int, bytes]:
         """SET a single channel to a raw device value (0..DEVICE_VALUE_MAX).
 
-        PR-3c (2026-06-06): fixed two bugs vs the v0.0.1 stub:
-          - value is now uint32 LE (4 bytes), matching the read-side
-            CHANNEL_STATE_ITEM_LEN. Was uint16 LE (2 bytes), inherited
-            from the pump project's per-mille scale.
-          - clamp ceiling is now DEVICE_VALUE_MAX (20000), matching the
-            hot-fixed scale. Was 1000, which would have silently capped
-            every write at ~5%.
-
         DEPRECATED by PR-4 (2026-06-10): the device does NOT apply writes to
         attribute 1504/1513 — those are read-only live-state views. The real
         control path is build_set_all_channels (attribute 407). This builder
@@ -311,7 +320,6 @@ class FsciCodec:
             CHANNEL_STATE_ITEM_LEN,           # itemLen = 4
         ) + value_bytes
         return self._build_frame(_OP_CODE_SET, payload)
-
 
     def build_set_all_channels(
         self,

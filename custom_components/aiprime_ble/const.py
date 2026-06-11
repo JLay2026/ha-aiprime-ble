@@ -187,6 +187,28 @@ def percent_to_write(pct: float) -> int:
     return round(pct * DEVICE_WRITE_VALUE_MAX / USER_VALUE_MAX)
 
 
+# === PR-4c (2026-06-11): myAI connect-time read preamble ===================
+# Decoded from the myAI iOS capture: before issuing attr-407 control writes,
+# myAI reads a batch of config/state/schedule attributes (capture msgids 2-7).
+# Our byte-identical 407 writes return SUCCESS but the device does NOT apply
+# them unless it has first been "primed" by these reads — myAI works with the
+# schedule active; we (skipping the reads) do not. Each tuple is
+# (attr_id, instance, count); grouped to mirror myAI's batched GET frames.
+# Only the attributes we weren't already reading are included here.
+MYAI_PRIME_READ_GROUPS: tuple[tuple[tuple[int, int, int], ...], ...] = (
+    ((201, 0, 1), (207, 0, 1), (205, 0, 1), (206, 0, 1)),
+    ((907, 0, 1), (905, 0, 1), (903, 0, 1), (904, 0, 1), (902, 0, 1)),
+    ((ATTR_SCHEDULE, 0, 255), (511, 0, 1)),
+)
+
+# Lighter re-prime issued immediately before each control write: re-read the
+# schedule (attr 500). myAI only primes at connect, but we also do this
+# per-write in case the priming is time-bounded (user choice, PR-4c).
+MYAI_WRITE_PRIME_GROUP: tuple[tuple[int, int, int], ...] = (
+    (ATTR_SCHEDULE, 0, 255),
+)
+
+
 # --- Dispatcher signals ---------------------------------------------------
 SIGNAL_STATE_UPDATED = "aiprime_ble_state_updated_{entry}"
 SIGNAL_AVAILABILITY = "aiprime_ble_availability_{entry}"

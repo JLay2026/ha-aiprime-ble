@@ -13,34 +13,37 @@ PR-3b (2026-06-02) — small read + polish:
     state.firmware (lights up the existing Firmware sensor).
   - First 5 connect attempts log at DEBUG instead of WARNING.
 
-Hot-fix (2026-06-02, rebased onto post-PR-3b main) — channel-state poll
-now reads CHANNEL_STATE_ITEM_LEN (=4) bytes as uint32 LE at attribute 1504
-(was 2 bytes at 1500 — that's a status word, not brightness).
+Hot-fix (2026-06-02) — channel-state poll reads CHANNEL_STATE_ITEM_LEN (=4)
+bytes as uint32 LE at attribute 1504.
 
-Retry-with-backoff (2026-06-02, PR-3c precursor) — `_send_request` is now a
-retry wrapper around a single-attempt `_send_request_once`.
+Retry-with-backoff — `_send_request` is a retry wrapper around a single
+attempt `_send_request_once` (3 attempts, 5s/3s/3s, 0.5s/1.0s backoffs).
 
-PR-3c..3f (2026-06-06/07) — per-channel write attempts to attributes 1504
-and 1513, and a CHAR_AUX experiment. ALL produced status=SUCCESS (or, for
-AUX, timeouts) but never physically drove the light. Root cause found via
-an iOS PacketLogger capture of the myAI app (2026-06-10): 1504/1513 are
-read-only live-state views; the real control-write path is attribute 407
-as an ALL-CHANNEL bulk SET. See [[aiprime-write-protocol-decoded]].
+PR-3c..3f (2026-06-06/07) — per-channel write attempts to attrs 1504/1513,
+and a CHAR_AUX experiment. All returned SUCCESS (or AUX timeouts) but never
+drove the light. Root cause via iOS PacketLogger capture of myAI
+(2026-06-10): 1504/1513 are read-only live-state views; the real control
+write is attribute 407 as an ALL-CHANNEL bulk SET.
+[[aiprime-write-protocol-decoded]]
 
-PR-4 (2026-06-10) — implement the decoded control path:
-  - Writes go to CHAR_TX_DATA (confirmed correct by capture; reverts the
-    PR-3e CHAR_AUX experiment).
-  - self._desired holds a write-scale (0..1000) value per channel. Every
-    HA control action updates the relevant channel(s) then sends ONE
-    codec.build_set_all_channels frame (attr 407) carrying all 7 channels,
-    exactly as myAI does.
-  - async_set_channel / async_set_power both funnel through
-    _write_all_channels(ramp) with optimistic UI + revert on failure.
+PR-4 (2026-06-10) — implement the decoded control path: writes go to
+CHAR_TX_DATA; self._desired holds per-channel write-scale (0..1000) values;
+every control action sends ONE codec.build_set_all_channels frame (attr 407)
+for all 7 channels. async_set_channel / async_set_power funnel through
+_write_all_channels(ramp) with optimistic UI + revert on failure.
+
+PR-4c (2026-06-11) — write priming. PR-4 writes reached the device
+(SUCCESS) but it didn't apply them while a schedule was active, whereas
+myAI's byte-identical writes DID. The full myAI session decode shows the
+only difference: myAI reads a batch of config/state/schedule attributes
+(201/207/205/206, 907/905/903/904/902, 500/511) at connect before writing.
+We now replicate that:
+  - _async_prime() issues those batched GET reads (best-effort).
+  - Called once at connect, and again (schedule re-read) before each write.
 
 Reconnect topology: one long-running `_connect_with_retry` task per
-"connection epoch". The bleak disconnect callback spawns a fresh task when
-the link drops — at most one connect task in flight, guarded by
-`_connect_task` and the per-attempt `_connect_lock`.
+"connection epoch"; the bleak disconnect callback spawns a fresh task when
+the link drops, guarded by `_connect_task` and `_connect_lock`.
 """
 
 from __future__ import annotations
@@ -86,6 +89,8 @@ from .const import (
     DEVICE_VALUE_MAX,
     DEVICE_WRITE_VALUE_MAX,
     DOMAIN,
+    MYAI_PRIME_READ_GROUPS,
+    MYAI_WRITE_PRIME_GROUP,
     RAMP_POWER,
     RAMP_SLIDER,
     SIGNAL_AVAILABILITY,
@@ -112,14 +117,10 @@ _DEFAULT_RETRIES = 2
 _QUIET_CONNECT_ATTEMPTS = 5
 
 # PR-4 (2026-06-10): writes go to attribute 407 as an all-channel bulk SET
-# (decoded from the myAI app via iOS HCI capture). The old per-channel
-# "unwritable" exclusion (fan 0x01 / moonlight 0x1E) is gone — the bulk
-# frame includes all 7 channels exactly as myAI sends them. See
-# [[aiprime-write-protocol-decoded]].
-
-# Characteristic used for FSCI request writes. CHAR_TX_DATA (01ff0103) is the
-# correct target, confirmed by the myAI iOS capture (writes land on GATT
-# handle 0x002b = CHAR_TX_DATA). PR-3e's CHAR_AUX experiment is reverted here.
+# (decoded from myAI). PR-4c (2026-06-11): a connect-time + per-write read
+# preamble (see const.MYAI_PRIME_READ_GROUPS) primes the device so it honors
+# the writes. Write characteristic is CHAR_TX_DATA, confirmed by the capture
+# (writes land on GATT handle 0x002b).
 _WRITE_CHARACTERISTIC = CHAR_TX_DATA
 
 _FrameBuilder = Callable[[], "tuple[int, bytes]"]
@@ -150,15 +151,12 @@ class AIPrimeHub:
         self._poll_lock = asyncio.Lock()
 
         # PR-3c: track last-seen nonzero value per channel for "Master ON"
-        # restore. Populated by writes AND by periodic polls (so values set
-        # via Mobius / device schedule are also remembered).
+        # restore. Populated by writes AND by periodic polls.
         self._last_nonzero_values: dict[int, int] = {}
 
         # PR-4: desired write-state per channel in WRITE scale (0..1000).
         # myAI controls the light by writing ALL channels at once to attr 407;
-        # we mirror that. Seeded to 0 for every channel, updated from reads
-        # (readable channels) and from HA-initiated writes. See memory
-        # [[aiprime-write-protocol-decoded]].
+        # we mirror that. Seeded to 0, updated from reads + HA writes.
         self._desired: dict[int, int] = {cid: 0 for cid in ALL_CHANNEL_IDS}
 
     async def async_setup(self) -> None:
@@ -286,8 +284,8 @@ class AIPrimeHub:
                 await self._async_disconnect()
                 return
 
-            # PR-3e (2026-06-07): also subscribe to CHAR_AUX notify (harmless;
-            # kept across PR-4 in case a future probe needs it). Best-effort.
+            # PR-3e: also subscribe to CHAR_AUX notify (harmless; kept across
+            # PR-4/4c in case a future probe needs it). Best-effort.
             try:
                 await client.start_notify(CHAR_AUX, self._on_rx_final)
                 _LOGGER.debug(
@@ -307,6 +305,9 @@ class AIPrimeHub:
             await self._read_fsci_firmware()
             await self._async_discover_channels()
             await self._async_read_channel_state()
+            # PR-4c: myAI's connect-time read preamble — the device requires
+            # priming before it honors live attr-407 control writes.
+            await self._async_prime(MYAI_PRIME_READ_GROUPS, "connect")
             await self._read_device_info(client)
 
             self._notify_availability_changed()
@@ -390,13 +391,9 @@ class AIPrimeHub:
     ) -> bytes | None:
         """Send an FSCI request with retry-with-backoff on timeout.
 
-        BT proxy ACL fragmentation drops payload-bearing notifications even
-        after PSRAM enablement (see [[aiprime-bt-proxy-acl-fragmentation]]).
-        Three attempts with 0.5s/1.0s backoffs compound per-attempt success.
-
         Each attempt invokes `builder()` fresh so a late response to a
-        timed-out attempt is discarded (logged as unmatched RX) rather
-        than shadowing the new request.
+        timed-out attempt is discarded (logged as unmatched RX) rather than
+        shadowing the new request. Stops retrying on BLE disconnect.
         """
         last_msg_id = -1
         for attempt in range(retries + 1):
@@ -433,11 +430,8 @@ class AIPrimeHub:
     async def _send_request_once(
         self, msg_id: int, frame: bytes, timeout: float
     ) -> bytes | None:
-        """Single-attempt FSCI round-trip. Caller (`_send_request`) handles retries.
-
-        Writes go to _WRITE_CHARACTERISTIC (CHAR_TX_DATA, confirmed correct
-        by the myAI iOS capture 2026-06-10).
-        """
+        """Single-attempt FSCI round-trip. Writes go to _WRITE_CHARACTERISTIC
+        (CHAR_TX_DATA, confirmed by the myAI iOS capture)."""
         client = self._client
         if client is None or not client.is_connected:
             _LOGGER.debug(
@@ -493,14 +487,7 @@ class AIPrimeHub:
             )
 
     async def _read_fsci_firmware(self) -> None:
-        """Round-trip GET ATTR_FIRMWARE_VERSION(11), populate state.firmware.
-
-        Decode strategy (best-effort, in priority order):
-          1. Printable ASCII → use as-is (covers "1.0", "1.2.3-rc4", etc.).
-          2. 1-4 bytes → packed version bytes joined with "." (covers
-             0x04 0x02 0x01 0x01 → "4.2.1.1").
-          3. Anything else → hex string for diagnostic visibility.
-        """
+        """Round-trip GET ATTR_FIRMWARE_VERSION(11), populate state.firmware."""
         reply = await self._send_request(
             lambda: self._codec.build_get_attribute(ATTR_FIRMWARE_VERSION)
         )
@@ -627,12 +614,9 @@ class AIPrimeHub:
         """Per-channel GET ATTR_LIVE_CHANNEL_STATE; updates state.channels values.
 
         Channels 0x01 (fan) and 0x1E return InvalidElement on attribute 1504
-        — both are system-managed and don't read back; that's intentional.
-
-        PR-3c: nonzero reads populate _last_nonzero_values for Master-ON
-        restore. PR-4: reads also seed the write-scale _desired mirror for
-        the readable channels (0x01 / 0x1E stay at their last HA-written
-        value since they never read back).
+        — system-managed, don't read back; intentional. Nonzero reads populate
+        _last_nonzero_values (Master-ON restore) and seed the write-scale
+        _desired mirror (PR-4).
         """
         if not self.state.channels:
             _LOGGER.debug(
@@ -674,7 +658,8 @@ class AIPrimeHub:
             if value > 0:
                 self._last_nonzero_values[channel_id] = value
             # PR-4: keep the write-scale desired mirror in sync with reality
-            # for the channels we can actually read.
+            # for the channels we can actually read (0x01 / 0x1E never read
+            # back — they stay at their last HA-written value).
             self._desired[channel_id] = device_read_to_write(value)
             cs = self.state.channels.get(channel_id)
             if cs is not None and cs.value_device != value:
@@ -710,13 +695,38 @@ class AIPrimeHub:
             self.state.rssi = service_info.rssi
             self._notify_state_changed()
 
+    async def _async_prime(self, groups, label: str) -> None:
+        """Issue myAI's batched "priming" GET reads (best-effort).
+
+        Decoded from the myAI capture: the device only honors live attr-407
+        control writes after being primed by reading config/schedule state
+        (see const.MYAI_PRIME_READ_GROUPS). Responses are intentionally
+        ignored — we just need the device to process the reads. Failures are
+        swallowed so a flaky prime never blocks the subsequent write.
+        """
+        for group in groups:
+            try:
+                await self._send_request(
+                    lambda g=group: self._codec.build_get_multi(g),
+                    retries=0,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "AIPrimeHub %s: prime read (%s) errored (ignored): %s",
+                    self.address, label, err,
+                )
+        _LOGGER.debug("AIPrimeHub %s: prime reads (%s) done", self.address, label)
+
     async def _write_all_channels(self, ramp: int) -> bool:
         """Write the full desired channel set via attribute 407 (PR-4).
 
-        This is the actual myAI control path (decoded 2026-06-10). One FSCI
-        SET to attr 407 carries all 7 channels at once. Returns True on a
-        Success CONFIRM, False otherwise (caller may revert optimistic UI).
+        One FSCI SET to attr 407 carries all 7 channels at once. Returns True
+        on a Success CONFIRM, False otherwise (caller may revert optimistic UI).
         """
+        # PR-4c: re-prime (read schedule) immediately before the control
+        # write, mirroring the device-state myAI establishes before writing.
+        await self._async_prime((MYAI_WRITE_PRIME_GROUP,), "pre-write")
+
         reply = await self._send_request(
             lambda: self._codec.build_set_all_channels(dict(self._desired), ramp)
         )
@@ -744,21 +754,12 @@ class AIPrimeHub:
     async def async_set_channel(self, channel_id: int, value_device: int) -> None:
         """Set one channel; writes the FULL channel set via attr 407 (PR-4).
 
-        The device only accepts an all-channels bulk write to attribute 407
-        (decoded from myAI 2026-06-10). So a single-channel HA action updates
-        that channel's desired value, then re-sends every channel. Other
-        channels are held at their current desired values.
+        value_device is in the READ scale (0..DEVICE_VALUE_MAX) from
+        number.py's percent_to_device(); converted to write scale (0..1000).
 
-        value_device is in the READ scale (0..DEVICE_VALUE_MAX, 0..20000) as
-        produced by number.py's percent_to_device(); we convert to the
-        write scale (0..1000) internally.
-
-        CAVEAT: channels 0x01 (fan) and 0x1E never read back (InvalidElement),
-        so their desired value is whatever HA last wrote (default 0). A bulk
-        write therefore sends 0 for them unless the user has set them via
-        their own entity. If moonlight (0x1E) was driven by the device
-        schedule, an HA channel change can switch it off. Follow-up: seed the
-        full state by reading attr 407 at connect. See task notes.
+        CAVEAT: channels 0x01 (fan) and 0x1E never read back, so their desired
+        value is whatever HA last wrote (default 0). Follow-up PR-4b: seed
+        full state by reading attr 407 at connect.
         """
         if channel_id not in self.state.channels:
             _LOGGER.warning(
@@ -790,11 +791,9 @@ class AIPrimeHub:
     async def async_set_power(self, *, on: bool) -> None:
         """Turn the fixture on/off via a single attr-407 bulk write (PR-4).
 
-        Off: set every LED channel desired to 0. On: restore each LED
-        channel's last-known nonzero value (read scale), falling back to
-        full scale if never seen. Fan (0x01) is left at its current desired
-        value (auto-managed; HA doesn't drive it). One bulk write applies
-        all of it with the power ramp.
+        Off: every LED channel desired to 0. On: restore each LED channel's
+        last-known nonzero value, falling back to full scale if never seen.
+        Fan (0x01) left as-is. One bulk write applies all of it.
         """
         prev_desired = dict(self._desired)
         prev_reads = {c: cs.value_device for c, cs in self.state.channels.items()}
