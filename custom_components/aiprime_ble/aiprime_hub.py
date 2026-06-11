@@ -41,6 +41,14 @@ We now replicate that:
   - _async_prime() issues those batched GET reads (best-effort).
   - Called once at connect, and again (schedule re-read) before each write.
 
+PR-4d (2026-06-11) — master-enable flag. Priming (PR-4c) ran but writes
+still didn't apply. Cross-referencing the myAI capture: every frame sets
+channel 0x01 to 1000 when ANY LED is on and 0 only when all-off. 0x01 is a
+MASTER-ENABLE flag, not a fan brightness — the device ignores the LED values
+unless 0x01 is set. We had been sending 0x01=0 every time (treating it as an
+excluded "fan"), so the device kicked the schedule but never applied our
+values. _write_all_channels now derives 0x01 from LED on-state per frame.
+
 Reconnect topology: one long-running `_connect_with_retry` task per
 "connection epoch"; the bleak disconnect callback spawns a fresh task when
 the link drops, guarded by `_connect_task` and `_connect_lock`.
@@ -727,8 +735,20 @@ class AIPrimeHub:
         # write, mirroring the device-state myAI establishes before writing.
         await self._async_prime((MYAI_WRITE_PRIME_GROUP,), "pre-write")
 
+        # PR-4d (2026-06-11): channel 0x01 is a MASTER-ENABLE flag, NOT a fan
+        # brightness. The myAI capture shows 0x01=1000 whenever ANY LED is on
+        # and 0x01=0 only when all-off; the device IGNORES the LED values
+        # unless 0x01 is set. (We had been sending 0x01=0 every time, so the
+        # device kicked the schedule but never applied our channel values.)
+        # Build the frame with 0x01 derived from LED on-state.
+        frame_values = dict(self._desired)
+        any_led_on = any(
+            v > 0 for cid, v in self._desired.items() if cid != CHANNEL_ID_FAN
+        )
+        frame_values[CHANNEL_ID_FAN] = DEVICE_WRITE_VALUE_MAX if any_led_on else 0
+
         reply = await self._send_request(
-            lambda: self._codec.build_set_all_channels(dict(self._desired), ramp)
+            lambda: self._codec.build_set_all_channels(frame_values, ramp)
         )
         if reply is None:
             _LOGGER.warning(
@@ -745,9 +765,9 @@ class AIPrimeHub:
             )
             return False
         _LOGGER.debug(
-            "AIPrimeHub %s: attr-407 channel write OK (ramp=0x%02x) desired=%s",
+            "AIPrimeHub %s: attr-407 channel write OK (ramp=0x%02x) sent=%s",
             self.address, ramp,
-            {f"0x{c:02x}": v for c, v in self._desired.items()},
+            {f"0x{c:02x}": v for c, v in frame_values.items()},
         )
         return True
 
