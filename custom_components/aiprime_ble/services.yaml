@@ -1,0 +1,24 @@
+deploy_profile:
+  name: Deploy schedule profile
+  description: >-
+    Deploy a .aip schedule profile to the AI Prime light. Writes the device's
+    native schedule (attribute 500), so the light runs it autonomously even if
+    Home Assistant or the BLE proxy goes offline.
+  fields:
+    profile:
+      name: Profile
+      description: >-
+        Profile name — the .aip filename without extension, from
+        <config>/aiprime/profiles/.
+      required: true
+      example: ai-signature-gregory
+      selector:
+        text:
+    entry_id:
+      name: Config entry
+      description: >-
+        Optional config entry ID to target a specific device. Omit to apply to
+        all configured AI Prime devices.
+      required: false
+      selector:
+        text:

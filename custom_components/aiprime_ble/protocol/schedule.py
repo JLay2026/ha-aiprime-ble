@@ -32,12 +32,17 @@ Rules proven against the capture:
     UNVERIFIED (assumed pass-through / 2000) until a capture exercises them
     above 1000: blue (0x11), warm_white (0x16), moonlight (0x1E).
 
+Read-back (PR-6): the device's active schedule is read via GET attr 500
+(CONFIRM payload = [status][attr 500][inst][count<=30][itemLen 24][points]
+[attr 511]). ``parse_schedule_read`` decodes the active points and
+``match_active_profile`` identifies which known .aip is loaded by comparing to
+``profile_to_points`` (same clamp/order rules used to deploy).
+
 See memory [[aiprime-aip-schedule-format]] and the project HANDOFF.
 """
 from __future__ import annotations
 
 import struct
-from typing import Iterable
 
 from .aip import AIP_COLORS, INTENSITY_MAX_AIP, MINUTES_PER_DAY, Profile
 from .fsci import crc16
@@ -53,6 +58,14 @@ __all__ = [
     "build_commit_frame",
     "build_schedule_set_frame",
     "profile_to_points",
+    "schedule_set_payload",
+    "commit_payload",
+    "decode_point",
+    "parse_schedule_read",
+    "match_active_profile",
+    "RESERVED_SCHEDULE",
+    "RESERVED_COMMIT",
+    "COMMIT_VALUES",
 ]
 
 # --- FSCI frame constants (mirror of fsci.py; schedule uses distinct reserved)
@@ -68,6 +81,11 @@ ATTR_SCHEDULE_COMMIT = 510  # commit/activate; values below replayed verbatim
 
 _AUX_511_VALUE = 1000
 _COMMIT_VALUES = (b"\x00\x00\x01\x01", b"\x00\x00\x01\x03")
+
+# Public aliases for the hub (which frames via FsciCodec.build_set_raw).
+RESERVED_SCHEDULE = _RESERVED_SCHEDULE
+RESERVED_COMMIT = _RESERVED_COMMIT
+COMMIT_VALUES = _COMMIT_VALUES
 
 # --- Point / channel layout ------------------------------------------------
 SCHEDULE_ITEM_LEN = 24
@@ -166,11 +184,14 @@ def _build_set_frame(msg_id: int, reserved: bytes, payload: bytes) -> bytes:
     return bytes([_STX]) + bytes(inner) + struct.pack("<H", crc)
 
 
-def build_schedule_set_frame(
+def schedule_set_payload(
     points: list[tuple[int, int, dict[int, int]]],
-    msg_id: int,
 ) -> bytes:
-    """Frame 1: multi-attr SET (attr 500 schedule + attr 511), reserved 0x0000."""
+    """Multi-attr SET payload: attr 500 (points + null terminator) + attr 511.
+
+    Framing-agnostic so the hub can wrap it with a codec-allocated msg_id via
+    ``FsciCodec.build_set_raw`` while the offline test uses an explicit msg_id.
+    """
     items = b"".join(_encode_point(t, flag, ch) for t, flag, ch in points)
     items += bytes(SCHEDULE_ITEM_LEN)  # null terminator (24 x 0x00)
     count = len(points) + 1
@@ -180,13 +201,25 @@ def build_schedule_set_frame(
     group511 = struct.pack("<HBBB", ATTR_SCHEDULE_AUX, 0, 1, 2) + struct.pack(
         "<H", _AUX_511_VALUE
     )
-    return _build_set_frame(msg_id, _RESERVED_SCHEDULE, group500 + group511)
+    return group500 + group511
+
+
+def commit_payload(value: bytes) -> bytes:
+    """SET attr 510 commit payload."""
+    return struct.pack("<HBBB", ATTR_SCHEDULE_COMMIT, 0, 1, len(value)) + value
+
+
+def build_schedule_set_frame(
+    points: list[tuple[int, int, dict[int, int]]],
+    msg_id: int,
+) -> bytes:
+    """Frame 1: multi-attr SET (attr 500 schedule + attr 511), reserved 0x0000."""
+    return _build_set_frame(msg_id, _RESERVED_SCHEDULE, schedule_set_payload(points))
 
 
 def build_commit_frame(value: bytes, msg_id: int) -> bytes:
     """Frame 2/3: SET attr 510 commit, reserved 0x0004."""
-    payload = struct.pack("<HBBB", ATTR_SCHEDULE_COMMIT, 0, 1, len(value)) + value
-    return _build_set_frame(msg_id, _RESERVED_COMMIT, payload)
+    return _build_set_frame(msg_id, _RESERVED_COMMIT, commit_payload(value))
 
 
 def build_deploy_sequence(
@@ -203,3 +236,72 @@ def build_deploy_sequence(
         mid = start_msg_id + offset
         frames.append((mid, build_commit_frame(value, mid)))
     return frames
+
+
+# ---------------------------------------------------------------------------
+# Read-back: decode an attr-500 GET CONFIRM and match it to a known profile
+# ---------------------------------------------------------------------------
+
+def decode_point(item: bytes) -> tuple[int, int, dict[int, int]] | None:
+    """Decode one 24-byte schedule point. Returns None for the all-zero
+    terminator / capacity padding so callers get only the active points."""
+    if len(item) < SCHEDULE_ITEM_LEN:
+        return None
+    if not any(item):
+        return None  # null terminator or capacity padding
+    minute = item[0] | (item[1] << 8)
+    flag = item[2]
+    chans: dict[int, int] = {}
+    pos = 3
+    for _ in range(7):
+        cid = item[pos]
+        val = item[pos + 1] | (item[pos + 2] << 8)
+        pos += 3
+        chans[cid] = val
+    return minute, flag, chans
+
+
+def parse_schedule_read(
+    point_values: list[bytes],
+) -> list[tuple[int, int, dict[int, int]]]:
+    """Decode the active points from an attr-500 GET CONFIRM.
+
+    `point_values` is the list returned by
+    ``parse_get_attribute_payload(reply, ATTR_SCHEDULE)`` -- one 24-byte entry
+    per schedule slot (capacity ~30). All-zero terminator/padding slots are
+    dropped. Returns active points sorted by minute.
+    """
+    points: list[tuple[int, int, dict[int, int]]] = []
+    for item in point_values:
+        decoded = decode_point(item)
+        if decoded is not None:
+            points.append(decoded)
+    points.sort(key=lambda p: p[0])
+    return points
+
+
+def _signature(points: list[tuple[int, int, dict[int, int]]]) -> frozenset:
+    """Order-independent fingerprint of (minute, channel-values). Flags are
+    excluded -- they're positional/derived, not identity-bearing."""
+    return frozenset(
+        (minute, tuple(sorted(chans.items())))
+        for minute, _flag, chans in points
+    )
+
+
+def match_active_profile(
+    read_points: list[tuple[int, int, dict[int, int]]],
+    profiles: dict[str, Profile],
+) -> str | None:
+    """Return the name of the profile whose generated schedule exactly matches
+    the device's active read-back points, or None if none match.
+
+    Deterministic: compares against ``profile_to_points`` of each candidate
+    (same clamp/order rules used to deploy), so a profile deployed by this
+    integration round-trips to an exact match.
+    """
+    target = _signature(read_points)
+    for name, profile in profiles.items():
+        if _signature(profile_to_points(profile)) == target:
+            return name
+    return None
