@@ -24,6 +24,10 @@ dist/
 .pytest_cache/
 htmlcov/
 
-# Secrets — never commit
+# Secrets - never commit
 secrets.yaml
 *.local
+
+# BLE captures - never commit (large; may carry unrelated device traffic).
+# Keep locally; regenerate test fixtures with tools/pklg.py. See tools/README.md.
+*.pklg
