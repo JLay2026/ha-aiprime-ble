@@ -1,16 +1,25 @@
 {
   "domain": "aiprime_ble",
   "name": "AI Prime BLE",
-  "codeowners": ["@JLay2026"],
+  "codeowners": [
+    "@JLay2026"
+  ],
   "config_flow": true,
-  "dependencies": ["bluetooth"],
+  "dependencies": [
+    "bluetooth",
+    "file_upload"
+  ],
   "documentation": "https://github.com/JLay2026/ha-aiprime-ble",
   "integration_type": "device",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/JLay2026/ha-aiprime-ble/issues",
-  "requirements": ["bleak-retry-connector>=3.4.0"],
-  "bluetooth": [
-    {"local_name": "MOBIUS"}
+  "requirements": [
+    "bleak-retry-connector>=3.4.0"
   ],
-  "version": "0.2.0"
+  "bluetooth": [
+    {
+      "local_name": "MOBIUS"
+    }
+  ],
+  "version": "0.3.0"
 }

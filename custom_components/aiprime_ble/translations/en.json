@@ -24,5 +24,21 @@
       "invalid_address": "Not a valid BLE MAC address.",
       "cannot_connect": "Cannot connect to the device."
     }
+  },
+  "options": {
+    "step": {
+      "import_profile": {
+        "title": "Import .aip schedule profile",
+        "description": "Upload an AquaIllumination .aip profile (exported from the myAI app). It is validated and saved to /config/aiprime/profiles/, then offered in the Schedule profile selector after the integration reloads.",
+        "data": {
+          "profile_file": "Profile file (.aip)",
+          "name": "Save as (optional, no extension)"
+        }
+      }
+    },
+    "error": {
+      "invalid_aip": "That file is not a valid .aip schedule profile.",
+      "write_failed": "Could not save the profile file — check the Home Assistant logs."
+    }
   }
 }
