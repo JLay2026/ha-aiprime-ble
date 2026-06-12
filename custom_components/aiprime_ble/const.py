@@ -2,6 +2,13 @@ from __future__ import annotations
 
 DOMAIN = "aiprime_ble"
 
+# PR-6: native .aip schedule deploy.
+# Profiles live under <config>/aiprime/profiles/*.aip (myAI authors+exports;
+# HA is read-only on the file side).
+PROFILES_SUBDIR = "aiprime/profiles"
+SERVICE_DEPLOY_PROFILE = "deploy_profile"
+ATTR_DEPLOY_PROFILE_NAME = "profile"
+
 # --- Config entry keys -----------------------------------------------------
 CONF_ADDRESS = "address"
 CONF_NAME = "name"
@@ -13,7 +20,7 @@ DEFAULT_STATE_POLL_INTERVAL_S = 30.0   # how often to re-read live channel state
 DEFAULT_CONNECT_TIMEOUT_S = 10.0
 
 # --- Platforms ------------------------------------------------------------
-PLATFORMS: list[str] = ["light", "number", "sensor"]
+PLATFORMS: list[str] = ["light", "number", "select", "button", "sensor"]
 
 # --- Proprietary GATT (FSCI transport, lifted from pump project; validated
 # Day 3 against the AI Prime QCA4020 — bit-identical round-trip) -----------

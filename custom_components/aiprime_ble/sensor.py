@@ -21,6 +21,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .aiprime_hub import AIPrimeHub, get_hub
 from .const import CHANNEL_ID_FAN, DOMAIN, device_to_percent
+from .schedule_deploy import async_read_active_profile
 
 
 async def async_setup_entry(
@@ -29,6 +30,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     hub = get_hub(hass, entry)
+    entry_data = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
         [
             AIPrimeRssiSensor(hub),
@@ -40,6 +42,8 @@ async def async_setup_entry(
             AIPrimeSerialNumberSensor(hub),
             AIPrimeHardwareRevisionSensor(hub),
             AIPrimeSoftwareRevisionSensor(hub),
+            # PR-6: which .aip schedule the device is currently running.
+            AIPrimeActiveProfileSensor(hub, entry_data),
         ]
     )
 
@@ -188,3 +192,33 @@ class AIPrimeSoftwareRevisionSensor(_AIPrimeDeviceInfoSensor):
 
     def __init__(self, hub: AIPrimeHub) -> None:
         super().__init__(hub, "software_revision", "Software revision")
+
+
+class AIPrimeActiveProfileSensor(_AIPrimeSensorBase):
+    """The .aip schedule profile currently loaded on the device (PR-6).
+
+    Read back from attribute 500 and matched to a known profile in
+    <config>/aiprime/profiles/. Shows the profile name, "Unknown" when a
+    schedule is loaded that matches no known file, or None when no schedule
+    is present. The value is refreshed on add and after each deploy; it lives
+    in the per-entry data dict so the deploy path and this sensor share it.
+    """
+
+    _attr_icon = "mdi:playlist-check"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, hub: AIPrimeHub, entry_data) -> None:
+        super().__init__(hub, "active_profile", "Active schedule profile")
+        self._entry_data = entry_data
+
+    @property
+    def native_value(self) -> str | None:
+        return self._entry_data.get("active_profile")
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # One-shot read so the sensor populates shortly after startup without
+        # adding a recurring BLE poll. Deploys also refresh it.
+        self.hass.async_create_task(
+            async_read_active_profile(self.hass, self._entry_data)
+        )
