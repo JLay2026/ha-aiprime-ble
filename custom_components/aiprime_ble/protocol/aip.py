@@ -31,6 +31,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
+import shutil
 import xml.etree.ElementTree as ET
 
 # Full 6-color palette the AI Prime exposes, in a stable canonical order.
@@ -210,3 +212,38 @@ def parse_aip(source: str | Path, *, name: str | None = None) -> Profile:
             colors.setdefault("_unknown", [])  # marker; see present_colors()
 
     return Profile(name=name, version=version, checksum=checksum, colors=colors)
+
+
+def save_profile_file(
+    src_path: str | Path,
+    name: str | None,
+    dest_dir: str | Path,
+) -> str:
+    """Validate an .aip file and copy it into the profiles directory.
+
+    Pure/offline (stdlib only) so it can be unit-tested without Home Assistant.
+    Used by the config-flow .aip importer after HA's file_upload hands over the
+    uploaded temp path.
+
+    - Validates by parsing (raises :class:`AipParseError` on a non-.aip file).
+    - Destination filename is `name` (if given) else the source filename;
+      basename-only (path-traversal guard); `.aip` extension ensured.
+    - Creates `dest_dir` if missing.
+
+    Returns the saved filename (e.g. ``"my-profile.aip"``).
+    """
+    src_path = Path(src_path)
+    parse_aip(src_path)  # validate; raises AipParseError on invalid content
+
+    base = (name or "").strip() or src_path.name
+    base = os.path.basename(base)  # strip any directory components (traversal)
+    if not base.lower().endswith(".aip"):
+        base += ".aip"
+    if base in ("", ".aip"):
+        raise AipParseError("empty profile name")
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / base
+    shutil.copyfile(src_path, dest)
+    return base
