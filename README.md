@@ -57,8 +57,8 @@ AI Prime HD lights speak a closed binary protocol over BLE. There is no vendor
 API and no Home Assistant support. Everything here was reverse-engineered:
 
 - **FSCI codec** (Framing Serial Connectivity Interface, an NXP convention) —
-  a clean-room port from the pump-side project, confirmed **bit-identical**
-  against the AI Prime's Qualcomm QCA4020 via a live round-trip test.
+  implemented and confirmed **bit-identical** against the AI Prime's Qualcomm
+  QCA4020 via a live round-trip test.
 - **Live control path decoded** from an iOS PacketLogger capture of the myAI
   app: control is a single FSCI **SET attribute 407** carrying all channels at
   once, scale 0–1000, with channel `0x01` acting as a **master-enable** flag.
@@ -191,11 +191,6 @@ so other Prime models with different layouts still work for reads.
 
 ## Acknowledgments
 
-- [mpshevlotsky/ai-pump-feed-esp32](https://github.com/mpshevlotsky/ai-pump-feed-esp32)
-  — reverse-engineered AI's FSCI protocol on the pump side. The lighting product
-  uses bit-identical framing / GATT UUIDs / CRC / message-ID semantics, so the
-  transport codec was a near-direct lift; the lighting-specific control and
-  schedule attributes were decoded separately here.
 - The myAI app, whose BLE traffic (captured via iOS PacketLogger) made the
   control and schedule formats decodable.
 
